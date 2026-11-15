@@ -15,6 +15,13 @@ You ask a question in plain English. ClinicalChat:
 
 While it works, the chat shows a live **Agent activity** panel: understanding the question → gathering records → each specialist analysing → done.
 
+**Which agent answered?** Three cues show this:
+- An **agent strip** above the chat has one tile per agent. Each tile shows its state: Ready, Selected, Working…, Answered · time, cached answer, Requested · not permitted, or Not for your role.
+- Each question gets a "🧭 Routed to **<agent>** · Patient: **<name>**" line.
+- Every answer is headed with the agent's name.
+
+When a question names a patient, the patient card on the left switches to that patient.
+
 ## Features
 
 | Requirement | Implementation |
@@ -29,7 +36,7 @@ While it works, the chat shows a live **Agent activity** panel: understanding th
 | RAG | ChromaDB with the `all-MiniLM-L6-v2` embeddings (`vectorstore.py`), filtered by patient and domain. |
 | LangChain LCEL and Pydantic v2 | `PROMPT \| llm` chains with Pydantic output schemas and lenient JSON parsing. |
 | Audit | Every question is written to `data/audit/audit-YYYY-MM-DD.jsonl`. Optional Langfuse traces each LLM call. |
-| Gradio UI with login | One demo login per role, example questions, patient picker for staff, and **Export summary** (Markdown). |
+| Gradio UI with login | One demo login per role, example questions, patient picker for staff, live agent strip, and **⬇️ Export** (one-click Markdown download). |
 
 ### LLM budget (important with rate-limited back ends)
 
