@@ -1,0 +1,12 @@
+.venv
+.git
+.copilot-llm-home
+logs
+data/processed
+data/chroma
+data/cache
+data/audit
+data/exports
+**/__pycache__
+.pytest_cache
+.env

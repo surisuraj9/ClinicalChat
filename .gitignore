@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.copilot-llm-home/
+logs/
+data/processed/
+data/chroma/
+data/cache/
+data/audit/
+data/exports/
+*.egg-info/
