@@ -22,12 +22,7 @@ def test_no_patient_drug_check_is_explicit(engine):
     assert "no patient selected" in facts
 
 
-def test_safety_banner_always_lists_documented_allergies(orch, engine):
-    plan = Router(engine).route("Explain my results", "patient", own_patient="riya-das-27")
+def test_safety_banner_lists_documented_allergies_for_allergy_questions(orch, engine):
+    plan = Router(engine).route("What are the cross-reactivities for my sulfa allergy?", "patient", own_patient="riya-das-27")
     banner = orch.safety_banner(plan)
     assert "Documented allergies" in banner and "sulfamethoxazole" in banner.lower()
-
-
-def test_lab_context_is_focused_on_requested_panel(engine):
-    context, sources = engine.lab_context("Explain my thyroid results", "rahul-mehta-32")
-    assert sources == ["Thyroid function test sample zz.docx"] and "TSH" in context

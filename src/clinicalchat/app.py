@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 
 import gradio as gr
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import FastAPI, Form, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from clinicalchat.config import get_settings
 from clinicalchat.llm import describe_llm
-from clinicalchat.personas import authenticate
+from clinicalchat.personas import authenticate, signup
+from clinicalchat.signup_page import render_done, render_form
 from clinicalchat.ui import CSS, build_ui, login_message
 
 LOGO = Path(__file__).parent / "assets" / "logo.svg"
@@ -33,6 +35,21 @@ def create_app() -> FastAPI:
     @app.get("/brand/logo.svg", include_in_schema=False)
     def logo():
         return FileResponse(LOGO, media_type="image/svg+xml")
+
+    @app.get("/signup", include_in_schema=False)
+    def signup_form():
+        return HTMLResponse(render_form())
+
+    @app.post("/signup", include_in_schema=False)
+    async def signup_submit(full_name: str = Form(""), age: str = Form(""), gender: str = Form(""),
+                            username: str = Form(""), password: str = Form(""), confirm: str = Form(""),
+                            allergies: str = Form(""), medications: str = Form("")):
+        ok, msg = await run_in_threadpool(signup, username, password, confirm, full_name, age, gender, allergies, medications)
+        if ok:
+            return HTMLResponse(render_done(username.strip().lower()))
+        values = dict(full_name=full_name, age=age, gender=gender, username=username, allergies=allergies,
+                      medications=medications)
+        return HTMLResponse(render_form(values, msg), status_code=400)
 
     @app.get("/health")
     def health():

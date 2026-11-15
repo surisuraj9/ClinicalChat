@@ -1,28 +1,43 @@
-"""Orchestrator: route (no LLM) -> deterministic safety -> specialist agents in parallel (1 LLM call each) -> combine.
+"""Orchestrator — the 5-agent pipeline from the course slide:
 
-`ask()` is a generator of `Event`s so the UI can show live progress (routing, gathering records, analysing...).
+  📄 Data Extraction → 🔬 Clinical Analysis → 🚨 Risk Detection → 💡 Insight Generation → 💬 Patient Communication
+     (deterministic)      (deterministic:        (deterministic       (LLM, 1 call)           (LLM, 1 call, patients;
+                           Lab Interpreter,       rules)                                        held for clinician review)
+                           Radiology Analyzer,
+                           Allergy Safety)
+
+`ask()` / `upload()` are generators of `Event`s so the UI can show live progress. Deterministic safety information
+(drug/allergy conflicts, emergency guidance) is shown immediately and is never held back.
 """
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
-from clinicalchat.agents import AgentResult, SpecialistAgent
+from clinicalchat.agents import (AgentResult, InsightGenerationAgent, PatientCommunicationAgent, check_patient_text,
+                                 communication_markdown)
+from clinicalchat.analysis import AnalysisResult, ClinicalAnalysisAgent
 from clinicalchat.audit import Auditor
 from clinicalchat.engine import ClinicalEngine, alert_line
+from clinicalchat.extraction import DataExtractionAgent, ExtractionResult, assess_document, parse_upload
 from clinicalchat.llm import get_chat_model
 from clinicalchat.models import Domain
 from clinicalchat.rbac import AGENT_LABELS, AgentName, Role, policy
+from clinicalchat.risk import PATIENT_GUIDANCE, RiskAssessment, RiskDetectionAgent
 from clinicalchat.router import RoutePlan, Router
+from clinicalchat.store import Store, get_store
 
 HISTORY_TURNS = 3
-NEEDS_DOMAIN = {AgentName.LAB: Domain.LAB, AgentName.RADIOLOGY: Domain.RADIOLOGY}
+REVIEW_CONFIDENCE = 0.6
+LEVEL_BADGE = {"LOW": "🟢 LOW", "MODERATE": "🟡 MODERATE", "HIGH": "🟠 HIGH", "CRITICAL": "🔴 CRITICAL"}
 
 
 @dataclass
@@ -32,8 +47,9 @@ class Turn:
     patient_key: Optional[str]
     agents: List[str] = field(default_factory=list)
     safety: str = ""
-    answers: List[Dict[str, Any]] = field(default_factory=list)  # {label, markdown}
+    answers: List[Dict[str, Any]] = field(default_factory=list)  # {label, markdown, summary}
     blocked: str = ""
+    case_id: str = ""
     ts: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M"))
 
 
@@ -46,8 +62,9 @@ class ChatSession:
     selected_patient: Optional[str] = None
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     turns: List[Turn] = field(default_factory=list)
-    last_agents: List[AgentName] = field(default_factory=list)
     last_patient: Optional[str] = None
+    last_insight: Optional[Dict[str, Any]] = None  # {patient_key, question, output, risk}
+    busy: bool = False  # a question is streaming (the UI poller must not touch the chat)
 
     def history_text(self) -> str:
         lines = []
@@ -59,7 +76,7 @@ class ChatSession:
 
 @dataclass
 class Event:
-    kind: str  # status | safety | answer | blocked | done
+    kind: str  # status | step | safety | guidance | answer | case | blocked
     title: str = ""
     text: str = ""
     status: str = "done"  # pending | done
@@ -67,140 +84,393 @@ class Event:
     data: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class _Run:
+    """Everything one pipeline run produced (for audit and case creation)."""
+    ext: Optional[ExtractionResult] = None
+    analysis: Optional[AnalysisResult] = None
+    risk: Optional[RiskAssessment] = None
+    llm: List[AgentResult] = field(default_factory=list)
+    review_reasons: List[str] = field(default_factory=list)
+
+
 class Orchestrator:
     def __init__(self, engine: ClinicalEngine, llm: Optional[BaseChatModel] = None, auditor: Optional[Auditor] = None,
-                 max_workers: int = 4):
+                 store: Optional[Store] = None):
         self.engine = engine
         self.router = Router(engine)
         self.llm = llm or get_chat_model()
         self.auditor = auditor or Auditor(engine.settings)
-        self.agents = {name: SpecialistAgent(name, self.llm) for name in AgentName}
-        self.pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent")
+        self.store = store or get_store()
+        self.extraction = DataExtractionAgent(engine)
+        self.analysis = ClinicalAnalysisAgent(engine)
+        self.risk = RiskDetectionAgent(engine.kg)
+        self.insight = InsightGenerationAgent(self.llm)
+        self.communication = PatientCommunicationAgent(self.llm)
 
-    # ------------------------------------------------------------------ main entry
+    # ------------------------------------------------------------------ chat question
     def ask(self, question: str, session: ChatSession) -> Iterator[Event]:
         started = time.perf_counter()
         question = question.strip()
         turn = Turn(question=question, role=session.role.value, patient_key=None)
+        run = _Run()
 
-        yield Event("status", "🧭 Understanding your question", "Detecting intent and checking access…", "pending", "route")
-        same_patient = (session.own_patient or session.selected_patient) == session.last_patient
-        plan = self.router.route(question, session.role, session_patient=session.selected_patient,
-                                 own_patient=session.own_patient,
-                                 previous_agents=session.last_agents if same_patient else ())
+        yield Event("status", "🧭 Understanding your question", "Detecting the topic and checking access…", "pending", "route")
+        context_patient = session.selected_patient or session.last_patient  # staff follow-ups keep the patient
+        current = session.own_patient or context_patient
+        has_insight = bool(session.last_insight and session.last_insight.get("patient_key") == current)
+        plan = self.router.route(question, session.role, session_patient=context_patient,
+                                 own_patient=session.own_patient, has_last_insight=has_insight)
         turn.patient_key = plan.patient_key
-        patient = self.engine.patient(plan.patient_key)
-        who = patient.label if patient else "no specific patient"
-        route_text = f"**Patient:** {who}" + (" (named in question)" if plan.patient_source == "question" else "")
-        route_text += f"\n**Specialists:** {plan.describe()}" if not plan.blocked else ""
-        yield Event("status", "🧭 Routed", route_text, "done", "route", {"plan": plan.__dict__})
-
+        yield Event("status", "🧭 Routed", self._route_text(plan, session), "done", "route", {"plan": _plan_dict(plan)})
         if plan.blocked:
             turn.blocked = plan.blocked
             yield Event("blocked", "🔒 Access", plan.blocked)
-            return self._finish(session, turn, plan, [], started)
+            return self._finish(session, turn, plan, run, started)
 
-        # ---- deterministic safety first (always shown, no LLM)
+        if plan.mode == "general":
+            yield from self._general(question, session, plan, turn, run)
+        elif plan.mode == "explain" and has_insight:
+            yield from self._explain_last(question, session, turn, run)
+        else:
+            if session.role == Role.PATIENT and plan.symptoms and plan.patient_key:
+                self._save_symptoms(plan.patient_key, plan.symptoms)
+            yield from self._pipeline(question, session, plan, turn, run)
+        return self._finish(session, turn, plan, run, started)
+
+    def run(self, question: str, session: ChatSession) -> List[Event]:
+        return list(self.ask(question, session))
+
+    # ------------------------------------------------------------------ report upload
+    def upload(self, path: Path, session: ChatSession, display_name: Optional[str] = None,
+               report_type: str = "auto") -> Iterator[Event]:
+        started = time.perf_counter()
+        pol = policy(session.role)
+        key = session.own_patient if pol.own_record_only else session.selected_patient
+        name = display_name or Path(path).name
+        turn = Turn(question=f"[upload] {name}", role=session.role.value, patient_key=key)
+        plan = RoutePlan(mode="case", patient_key=key, patient_source="session", check_allergies=True,
+                         agents=[a for a in AgentName if a in pol.agents
+                                 and (a != AgentName.COMMUNICATION or session.role == Role.PATIENT)])
+        run = _Run()
+        if not pol.can_upload or not key:
+            turn.blocked = ("Uploading reports is not available for your role." if not pol.can_upload
+                            else "Select a patient first, then upload their report.")
+            yield Event("blocked", "🔒 Upload", turn.blocked)
+            return self._finish(session, turn, plan, run, started)
+        patient = self.engine.patient(key)
+        label = AGENT_LABELS[AgentName.EXTRACTION]
+        yield Event("status", f"{label} — reading {name}", "Extracting text (OCR for scans), sections and lab values…",
+                    "pending", "agent-extraction")
+        try:
+            doc = parse_upload(Path(path), patient_key=key, patient_name=patient.name, report_type=report_type,
+                               uploaded_by=session.username, uploaded_at=_now(), display_name=name,
+                               cache_dir=self.engine.settings.work_dir / "ocr_cache")
+        except Exception as exc:
+            turn.blocked = f"I could not read **{name}**: {exc}"
+            yield Event("status", f"{label} — failed", str(exc)[:200], "done", "agent-extraction")
+            yield Event("blocked", "📄 Upload", turn.blocked)
+            return self._finish(session, turn, plan, run, started)
+        quality = assess_document(doc, patient.name)
+        self.store.save_upload(doc.model_dump_json(), quality.model_dump(), key, doc.doc_id, name, session.username)
+        self.engine.add_document(doc)
+        labs = sum(len(s.lab_results) for s in doc.sections)
+        text = (f"Read **{name}** as a **{doc.category.replace('_', ' ')}** report ({doc.extraction_method}) — "
+                f"{len(doc.sections)} section(s), {labs} lab value(s). Extraction confidence: **{quality.level}** "
+                f"({quality.score:.0%}).")
+        if quality.issues:
+            text += "\n" + "\n".join(f"- ⚠️ {i}" for i in quality.issues[:4])
+        if quality.low_confidence:
+            text += "\n- 🚩 **Low-confidence extraction — flagged for clinician review**"
+        yield Event("step", f"{label} — report saved to the record", text, data={"agent": "extraction"})
+        plan.focus = [doc.domain] if doc.domain not in (Domain.REFERENCE,) else []
+        question = f"Please review my newly uploaded report '{name}'." if session.role == Role.PATIENT else \
+            f"Review the newly uploaded report '{name}' for {patient.name}."
+        turn.question = question
+        yield from self._pipeline(question, session, plan, turn, run, upload_doc_id=doc.doc_id)
+        return self._finish(session, turn, plan, run, started)
+
+    # ------------------------------------------------------------------ clinician review
+    def review(self, case_id: str, reviewer: str, approve: bool, note: str = "", edited_message: str = "") -> Dict[str, Any]:
+        case = self.store.case(case_id)
+        if not case:
+            raise ValueError(f"Unknown case {case_id}")
+        status = "VALIDATED" if approve else "RETURNED"
+        final = (edited_message.strip() or case["patient_draft"]) if approve else ""
+        if approve and note.strip():
+            final += f"\n\n**Note from your clinician:** {note.strip()}"
+        self.store.review_case(case_id, reviewer=reviewer, status=status, note=note.strip(), final_message=final)
+        topic = ", ".join(case["payload"].get("possible_conditions", [])[:3]) or case["question"][:80]
+        self.store.add_feedback(case_id, reviewer, status, note.strip(), topic)
+        self.auditor.record({"event": "review", "case": case_id, "reviewer": reviewer, "status": status,
+                             "note": note.strip(), "edited": bool(edited_message.strip())})
+        return self.store.case(case_id)
+
+    # ------------------------------------------------------------------ pipeline
+    def _pipeline(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
+                  upload_doc_id: Optional[str] = None) -> Iterator[Event]:
+        e, role = self.engine, session.role
+        patient = e.patient(plan.patient_key)
+        is_patient = role == Role.PATIENT
+
+        # 1) 📄 Data Extraction
+        label = AGENT_LABELS[AgentName.EXTRACTION]
+        if not upload_doc_id:
+            yield Event("status", f"{label} — gathering records", "Selecting the relevant reports and checking quality…",
+                        "pending", "agent-extraction")
+        ext = self.extraction.run(question, role, plan.patient_key, plan.focus, new_symptoms=plan.symptoms,
+                                  upload_doc_id=upload_doc_id)
+        run.ext = ext
+        if not upload_doc_id:
+            summary = self._extraction_text(ext, is_patient)
+            yield Event("status", f"{label} — done", summary.split("\n")[0], "done", "agent-extraction")
+            yield Event("step", label, summary, data={"agent": "extraction"})
+        else:
+            yield Event("status", f"{label} — done", "Upload processed", "done", "agent-extraction")
+
+        # 2) 🔬 Clinical Analysis (Lab Interpreter, Radiology Analyzer, Allergy Safety, symptom differential)
+        label = AGENT_LABELS[AgentName.ANALYSIS]
+        yield Event("status", f"{label} — analysing", "Checking values against reference ranges, imaging findings, "
+                    "allergies and symptoms…", "pending", "agent-analysis")
+        an = self.analysis.run(ext, plan.drugs, plan.allergens, check_allergies=plan.check_allergies)
+        run.analysis = an
+        summary = self._analysis_text(an, is_patient)
+        yield Event("status", f"{label} — done", summary.split("\n")[0], "done", "agent-analysis")
+        yield Event("step", label, summary, data={"agent": "analysis"})
         safety_md = self.safety_banner(plan)
         if safety_md:
             turn.safety = safety_md
             yield Event("safety", "🛡️ Safety check", safety_md)
 
-        # ---- gather records per agent (fast, local)
-        yield Event("status", "📚 Gathering records", "Searching patient records and the reference library…", "pending", "gather")
-        jobs = {}
-        audience = policy(session.role).audience
-        history = session.history_text()
-        no_data: List[AgentResult] = []
-        domains = set(self.engine.patient_domains(plan.patient_key)) if plan.patient_key else None
-        for name in plan.agents:
-            needed = NEEDS_DOMAIN.get(name)
-            if domains is not None and needed and needed not in domains:
-                # nothing to interpret for this patient -> answer without spending an LLM call
-                who_ = "your record" if session.role == Role.PATIENT else f"{patient.name}'s record"
-                no_data.append(AgentResult(agent=name, label=AGENT_LABELS[name], output={
-                    "answer": f"There are no {needed.value} reports on file in {who_}, so there is nothing to interpret yet. "
-                              "Once a report is added I can explain it.", "sources": []}))
-                continue
-            context, sources, facts = self._context_for(name, question, plan)
-            jobs[name] = dict(question=question, audience=audience, patient=self.engine.patient_summary(plan.patient_key),
-                              facts=facts, context=context, history=history, sources=sources)
-        n_sources = len({s for j in jobs.values() for s in j["sources"]})
-        yield Event("status", "📚 Records gathered",
-                    f"{n_sources} source document(s) selected for {len(jobs)} specialist(s)" if jobs else "No matching reports on file",
-                    "done", "gather")
+        # 3) 🚨 Risk Detection
+        label = AGENT_LABELS[AgentName.RISK]
+        yield Event("status", f"{label} — scoring", "Applying safety rules…", "pending", "agent-risk")
+        risk = self.risk.run(patient=patient, lab_results=an.lab_results,
+                             imaging=[(f.section, f.red_flags, f.abnormal) for f in an.imaging], symptoms=ext.symptoms,
+                             new_symptoms=ext.new_symptoms, proposed_drug_alerts=an.drug_alerts, medication_alerts=an.medication_alerts,
+                             conditions=an.possible_conditions, inconsistencies=an.inconsistencies,
+                             low_confidence=ext.quality.low_confidence)
+        run.risk = risk
+        summary = self._risk_text(risk, is_patient)
+        yield Event("status", f"{label} — {risk.risk_level}", summary.split("\n")[0], "done", "agent-risk")
+        yield Event("step", label, summary, data={"agent": "risk", "level": risk.risk_level})
+        guidance = risk.clinical_level
+        if is_patient and (ext.new_symptoms or upload_doc_id or guidance != "LOW"):
+            yield Event("guidance", "What to do now", PATIENT_GUIDANCE[guidance], data={"level": guidance})
 
-        # ---- run agents in parallel; stream each result as it finishes
-        config = {"callbacks": self.auditor.callbacks(), "tags": [session.role.value],
-                  "metadata": {"user": session.username, "session_id": session.session_id}}
-        futures = {}
-        for name, job in jobs.items():
-            yield Event("status", f"{AGENT_LABELS[name]} — analysing", "Reading the records and preparing an answer…",
-                        "pending", f"agent-{name.value}")
-            futures[self.pool.submit(self.agents[name].run, config=config, **job)] = name
-        results: List[AgentResult] = []
-        for res in no_data:
-            results.append(res)
-            md = render_result(res, session.role)
-            turn.answers.append({"label": res.label, "markdown": md, "summary": res.output["answer"][:300]})
-            yield Event("answer", res.label, md, data={"result": res.model_dump()})
-        for fut in as_completed(futures):
-            res = fut.result()
-            results.append(res)
-            secs = res.latency_ms / 1000
-            note = "cached answer" if res.cache_hit else f"{secs:.1f}s"
-            yield Event("status", f"{res.label} — {'done' if not res.error else 'failed'}", note, "done", f"agent-{res.agent.value}")
-            md = render_result(res, session.role)
-            turn.answers.append({"label": res.label, "markdown": md, "summary": (res.output or {}).get("answer", res.error)[:300]})
-            yield Event("answer", res.label, md, data={"result": res.model_dump()})
+        # 4) 💡 Insight Generation (LLM)
+        config = self._config(session)
+        label = AGENT_LABELS[AgentName.INSIGHT]
+        yield Event("status", f"{label} — writing", "Consolidating the findings (AI)…" if not is_patient else
+                    "Preparing a clinical summary for your clinician (AI)…", "pending", "agent-insight")
+        audience = policy(Role.CLINICIAN if is_patient else role).audience
+        ins = self.insight.run(question=question, audience=audience, patient=e.patient_summary(plan.patient_key),
+                               extraction=self._extraction_brief(ext), facts=an.facts_text(), risk=self._risk_brief(risk),
+                               feedback=self._feedback(), context=e.records_context(question, ext.sections, ext.focus),
+                               history=session.history_text(), config=config)
+        run.llm.append(ins)
+        out = ins.output or {}
+        run.review_reasons = self._review_reasons(ext, an, risk, ins)
+        yield Event("status", f"{label} — {'failed' if ins.error else 'done'}", _timing(ins), "done", "agent-insight")
+        session.last_insight = {"patient_key": plan.patient_key, "question": question, "output": out,
+                                "risk": risk.risk_level, "facts": an.facts_text()}
+        if not is_patient:
+            md = render_insight(ins, run.review_reasons, ext.sources)
+            turn.answers.append({"label": label, "markdown": md, "summary": str(out.get("answer", ins.error))[:300]})
+            yield Event("answer", label, md, data={"agent": "insight", "review": run.review_reasons})
+            if plan.mode != "explain":
+                return
 
-        return self._finish(session, turn, plan, results, started)
+        # 5) 💬 Patient Communication (LLM) — patients: held for clinician validation
+        if ins.error:
+            if is_patient:
+                yield Event("answer", "💬 Patient Communication", "_The AI assistant is busy right now, so I could not prepare "
+                            "a written explanation. The safety guidance above still applies — please try again shortly._",
+                            data={"agent": "communication"})
+            return
+        yield from self._communicate(question, session, plan, turn, run, out, risk.clinical_level, bool(an.abnormal or risk.escalate))
 
-    def run(self, question: str, session: ChatSession) -> List[Event]:
-        return list(self.ask(question, session))
+    def _communicate(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
+                     insight: Dict[str, Any], risk_level: str, abnormal: bool) -> Iterator[Event]:
+        is_patient = session.role == Role.PATIENT
+        label = AGENT_LABELS[AgentName.COMMUNICATION]
+        yield Event("status", f"{label} — writing", "Writing a plain-language explanation (AI)…", "pending", "agent-communication")
+        com = self.communication.run(question=question, patient=self.engine.patient_summary(plan.patient_key),
+                                     risk=f"{risk_level}: {PATIENT_GUIDANCE[risk_level]}",
+                                     insight=json.dumps(insight, ensure_ascii=False)[:6000], config=self._config(session))
+        run.llm.append(com)
+        yield Event("status", f"{label} — {'failed' if com.error else 'done'}", _timing(com), "done", "agent-communication")
+        if com.error:
+            yield Event("answer", label, f"_Could not write the explanation right now._ {com.error}", data={"agent": "communication"})
+            return
+        draft = communication_markdown(com.output or {})
+        issues = check_patient_text([draft], abnormal)
+        if is_patient and plan.patient_key:
+            case_id = self.store.create_case(
+                patient_key=plan.patient_key, created_by=session.username, question=question,
+                risk_level=run.risk.risk_level if run.risk else risk_level,
+                escalate=bool(run.risk and run.risk.escalate), review_required=bool(run.review_reasons or issues),
+                payload={"insight": insight, "facts": run.analysis.facts_text() if run.analysis else "",
+                         "risk": run.risk.model_dump() if run.risk else {}, "review_reasons": run.review_reasons,
+                         "guard_issues": issues, "sources": run.ext.sources if run.ext else [],
+                         "possible_conditions": insight.get("possible_conditions", [])},
+                patient_draft=draft)
+            turn.case_id = case_id
+            turn.answers.append({"label": label, "markdown": f"_Explanation sent to a clinician for review (case {case_id})._",
+                                 "summary": "Sent to clinician for review"})
+            yield Event("case", "📨 Sent for clinician review",
+                        f"Your explanation has been prepared and sent to a clinician to check (case **{case_id}**). "
+                        "You will see it here as soon as it is approved — usually within the day. "
+                        "The safety guidance above applies right now.", data={"case_id": case_id})
+        else:
+            md = draft + (("\n\n**🛡️ Guard check before sending:**\n" + "\n".join(f"- ⚠️ {i}" for i in issues))
+                          if issues else "\n\n<sub>🛡️ Guard check passed (no doses, no definitive diagnosis).</sub>")
+            turn.answers.append({"label": label, "markdown": md, "summary": str((com.output or {}).get("message", ""))[:300]})
+            yield Event("answer", f"{label} — patient-friendly draft", md, data={"agent": "communication"})
+
+    def _explain_last(self, question: str, session: ChatSession, turn: Turn, run: _Run) -> Iterator[Event]:
+        last = session.last_insight or {}
+        plan = RoutePlan(mode="explain", patient_key=last.get("patient_key"))
+        yield from self._communicate(last.get("question", question), session, plan, turn, run, last.get("output", {}),
+                                     last.get("risk", "LOW"), "outside reference range" in last.get("facts", "")
+                                     or last.get("risk") in ("HIGH", "CRITICAL"))
+
+    def _general(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run) -> Iterator[Event]:
+        """General health question from a patient: informational answer, no personal records, no review needed."""
+        safety_md = self.safety_banner(plan)
+        if safety_md:
+            turn.safety = safety_md
+            yield Event("safety", "🛡️ Safety check", safety_md)
+        context, sources = self.engine.reference_context(question)
+        label = AGENT_LABELS[AgentName.COMMUNICATION]
+        yield Event("status", f"{label} — answering", "Looking up reference information and writing an answer (AI)…",
+                    "pending", "agent-communication")
+        p = self.engine.patient(plan.patient_key)
+        allergies = ", ".join(a.allergen for a in p.allergies) if p and p.allergies else "none recorded"
+        com = self.communication.run(question=question, patient=f"Documented allergies: {allergies}",
+                                     risk="Not applicable (general question).", insight=context, general=True,
+                                     config=self._config(session))
+        run.llm.append(com)
+        yield Event("status", f"{label} — {'failed' if com.error else 'done'}", _timing(com), "done", "agent-communication")
+        if com.error:
+            md = f"_The AI assistant is busy right now — please try again shortly._ ({com.error[:120]})"
+        else:
+            md = communication_markdown(com.output or {})
+            md += "\n\n<sub>ℹ️ General health information, not personal medical advice."
+            md += f" Sources: {', '.join(sources)}</sub>" if sources else "</sub>"
+        turn.answers.append({"label": label, "markdown": md, "summary": md[:300]})
+        yield Event("answer", label, md, data={"agent": "communication"})
 
     # ------------------------------------------------------------------ helpers
-    def _finish(self, session: ChatSession, turn: Turn, plan: RoutePlan, results: List[AgentResult], started: float) -> None:
-        turn.agents = [a.value for a in plan.agents]
-        session.turns.append(turn)
-        if plan.agents:
-            session.last_agents = list(plan.agents)
-            session.last_patient = plan.patient_key
-        self.auditor.record({
-            "session": session.session_id, "user": session.username, "role": session.role.value,
-            "patient": plan.patient_key, "question": turn.question, "agents": turn.agents,
-            "denied": [a.value for a in plan.denied], "blocked": plan.blocked,
-            "drugs": plan.drugs, "allergens": plan.allergens, "safety_shown": bool(turn.safety),
-            "llm_calls": sum(1 for r in results if not r.cache_hit and not r.error),
-            "cache_hits": sum(1 for r in results if r.cache_hit),
-            "errors": [r.error for r in results if r.error],
-            "latency_ms": int((time.perf_counter() - started) * 1000),
-        })
+    def _save_symptoms(self, key: str, symptoms: List[str]) -> None:
+        known = set(self.engine.kg.patient_symptoms(key))
+        for s in symptoms:
+            if s not in known:
+                self.store.add_fact(key, "symptom", s)
+                self.engine.apply_fact(key, "symptom", s)
 
-    def _context_for(self, name: AgentName, question: str, plan: RoutePlan):
-        e, key = self.engine, plan.patient_key
-        allergy_line = self._allergy_line(key)
-        if name == AgentName.LAB:
-            context, sources = e.lab_context(question, key)
-            facts = "Lab flags in RECORDS (-> NORMAL/HIGH/LOW/CRITICAL) were computed from the printed reference ranges."
-        elif name == AgentName.RADIOLOGY:
-            context, sources = e.radiology_context(question, key)
-            facts = allergy_line + ("\nIf iodinated/gadolinium contrast is relevant, comment on contrast safety." if key else "")
-        elif name == AgentName.ALLERGY:
-            context, sources = e.allergy_context(question, key, plan.drugs, plan.allergens)
-            facts = e.allergy_facts(key, plan.drugs, plan.allergens)
+    def _feedback(self) -> str:
+        notes = self.store.recent_feedback(3)
+        return "\n".join(f"- ({n['action'].lower()}) {n['note']}" for n in notes) or "None."
+
+    def _config(self, session: ChatSession) -> dict:
+        return {"callbacks": self.auditor.callbacks(), "tags": [session.role.value],
+                "metadata": {"user": session.username, "session_id": session.session_id}}
+
+    def _route_text(self, plan: RoutePlan, session: ChatSession) -> str:
+        p = self.engine.patient(plan.patient_key)
+        who = p.label if p else "no specific patient"
+        text = f"**Patient:** {who}" + (" (named in question)" if plan.patient_source == "question" else "")
+        return text + (f"\n**Pipeline:** {plan.describe()}" if not plan.blocked else "")
+
+    @staticmethod
+    def _review_reasons(ext: ExtractionResult, an: AnalysisResult, risk: RiskAssessment, ins: AgentResult) -> List[str]:
+        reasons = []
+        conf = (ins.output or {}).get("confidence")
+        if ins.error or not ins.parsed:
+            reasons.append("AI output could not be fully validated")
+        if isinstance(conf, (int, float)) and conf < REVIEW_CONFIDENCE:
+            reasons.append(f"Low confidence ({conf:.0%})")
+        if ext.quality.low_confidence:
+            reasons.append("Low-confidence data extraction")
+        if not ext.sufficient:
+            reasons.append("Insufficient data")
+        if an.inconsistencies:
+            reasons.append("Clinical inconsistency")
+        if risk.escalate:
+            reasons.append(f"Risk {risk.risk_level} — escalated for clinician validation")
+        return reasons
+
+    def _extraction_text(self, ext: ExtractionResult, is_patient: bool) -> str:
+        if ext.sections:
+            what = "your" if is_patient else "the"
+            text = f"Selected {len(ext.sections)} section(s) from {what} records: {', '.join(ext.sources[:5])}"
+            if not ext.reference_only:
+                text += f" · extraction confidence **{ext.quality.level}**"
         else:
-            context, sources = e.coordinator_context(question, key)
-            facts = allergy_line
-        return context, sources, facts
+            text = "No matching reports on file"
+        if ext.new_symptoms:
+            text += "\n- 📝 Saved to " + ("your record" if is_patient else "the record") + ": " + ", ".join(ext.new_symptoms)
+        text += "".join(f"\n- ℹ️ {m}" for m in ext.missing[:3])
+        text += "".join(f"\n- ⚠️ {i}" for i in ext.quality.issues[:3])
+        if ext.denied:
+            text += "\n- 🔒 Not permitted for your role: " + ", ".join(d.value.replace("_", " ") for d in ext.denied)
+        return text
 
-    def _allergy_line(self, key: Optional[str]) -> str:
-        p = self.engine.patient(key)
-        if not p:
-            return "No patient selected."
-        if not p.allergies:
-            return "No documented allergies."
-        return "Documented allergies: " + ", ".join(f"{a.allergen} ({a.severity})" for a in p.allergies)
+    @staticmethod
+    def _extraction_brief(ext: ExtractionResult) -> str:
+        lines = [f"Records used: {', '.join(ext.sources) or 'none'}", f"Extraction quality: {ext.quality.level} ({ext.quality.score:.2f})"]
+        if ext.symptoms:
+            lines.append("Patient-reported symptoms: " + ", ".join(ext.symptoms))
+        lines += [f"Missing: {m}" for m in ext.missing] + [f"Quality issue: {i}" for i in ext.quality.issues[:4]]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _analysis_text(an: AnalysisResult, is_patient: bool) -> str:
+        out = []
+        if an.lab_results:
+            line = f"**Lab Interpreter:** {len(an.lab_results)} values checked, {len(an.abnormal)} outside the normal range"
+            if an.abnormal:
+                line += " — " + ", ".join(f"{r.parameter} {r.value_text} ({r.status.value.lower()})" for r, _ in an.abnormal[:6])
+            out.append(line)
+        for f in an.imaging[:2]:
+            line = f"**Radiology Analyzer:** {f.section.title}"
+            if f.red_flags:
+                line += " — 🚩 " + "; ".join(h[:90] for h in f.red_flags[:2])
+            elif f.abnormal:
+                line += " — " + "; ".join(h[:90] for h in f.abnormal[:2])
+            else:
+                line += " — no abnormal finding flagged"
+            out.append(line)
+        if an.drug_alerts:
+            out.append("**Allergy Safety:** " + "; ".join(f"{a.level} — {a.drug} vs {a.against}" for a in an.drug_alerts))
+        elif an.allergies:
+            out.append("**Allergy Safety:** documented allergies " + ", ".join(an.allergies))
+        if an.differential:
+            prefix = "**Symptoms may fit (not a diagnosis):** " if is_patient else "**Symptom differential (KG):** "
+            out.append(prefix + ", ".join(str(d["condition"]) for d in an.differential[:4]))
+        out += [f"⚠️ **Clinical inconsistency:** {i}" for i in an.inconsistencies[:2]]
+        return "\n".join(f"- {o}" for o in out) if out else "- Nothing to analyse yet (no reports or symptoms)"
+
+    @staticmethod
+    def _risk_text(risk: RiskAssessment, is_patient: bool) -> str:
+        if is_patient:
+            text = f"Health risk from your symptoms and reports: **{LEVEL_BADGE[risk.clinical_level]}**"
+            if any(i.category == "medication" for i in risk.indicators):
+                text += " · ⛔ medicine safety alert"
+            if risk.escalate:
+                text += " · flagged for a clinician to check"
+            return text + "".join(f"\n- {i.indicator}" for i in risk.indicators[:5])
+        text = f"Risk level **{LEVEL_BADGE[risk.risk_level]}** · urgency {risk.urgency.lower()}"
+        if risk.escalate:
+            text += " · **escalated for clinician validation**"
+        text += "".join(f"\n- {i.indicator}" for i in risk.indicators[:5])
+        return text
+
+    @staticmethod
+    def _risk_brief(risk: RiskAssessment) -> str:
+        lines = [f"Risk level {risk.risk_level}, urgency {risk.urgency}, escalate={risk.escalate}"]
+        return "\n".join(lines + [f"- [{i.level}] {i.indicator}" for i in risk.indicators[:10]])
 
     def safety_banner(self, plan: RoutePlan) -> str:
         p = self.engine.patient(plan.patient_key)
@@ -212,54 +482,65 @@ class Orchestrator:
         if plan.drugs and not alerts:
             lines.append(f"✅ No allergy or interaction conflict found for **{', '.join(plan.drugs)}**"
                          + ("" if p else " (select a patient to check their allergies)"))
-        if p and p.allergies:
+        if p and p.allergies and (plan.drugs or plan.allergens or Domain.ALLERGY in plan.focus):
             lines.append("🩺 **Documented allergies:** " + "; ".join(
                 f"{a.allergen} ({a.severity.lower()}{', ' + ', '.join(a.reactions[:2]) if a.reactions else ''})" for a in p.allergies))
         return "\n".join(lines)
 
+    def _finish(self, session: ChatSession, turn: Turn, plan: RoutePlan, run: _Run, started: float) -> None:
+        turn.agents = [a.value for a in plan.agents]
+        session.turns.append(turn)
+        if plan.patient_key:
+            session.last_patient = plan.patient_key
+        self.auditor.record({
+            "session": session.session_id, "user": session.username, "role": session.role.value,
+            "patient": plan.patient_key, "question": turn.question, "mode": plan.mode, "agents": turn.agents,
+            "denied_domains": [d.value for d in plan.denied_domains], "blocked": plan.blocked,
+            "drugs": plan.drugs, "symptoms": plan.symptoms, "safety_shown": bool(turn.safety),
+            "risk_level": run.risk.risk_level if run.risk else None, "escalate": bool(run.risk and run.risk.escalate),
+            "review_reasons": run.review_reasons, "case_id": turn.case_id,
+            "llm_calls": sum(1 for r in run.llm if not r.cache_hit and not r.error),
+            "cache_hits": sum(1 for r in run.llm if r.cache_hit),
+            "errors": [r.error for r in run.llm if r.error],
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        })
+
 
 # ---------------------------------------------------------------------- rendering
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _timing(res: AgentResult) -> str:
+    if res.error:
+        return res.error[:160]
+    return "cached answer" if res.cache_hit else f"{res.latency_ms / 1000:.1f}s"
+
+
+def _plan_dict(plan: RoutePlan) -> Dict[str, Any]:
+    return {"mode": plan.mode, "patient_key": plan.patient_key, "agents": [a.value for a in plan.agents],
+            "denied_domains": [d.value for d in plan.denied_domains], "symptoms": plan.symptoms, "drugs": plan.drugs}
+
+
 def _bullets(title: str, items) -> str:
     items = [i for i in (items or []) if str(i).strip()]
     return f"\n\n**{title}**\n" + "\n".join(f"- {i}" for i in items) if items else ""
 
 
-URGENCY_BADGE = {"SOON": "🟡 Soon", "URGENT": "🟠 Urgent", "EMERGENCY": "🔴 Emergency"}
-
-
-def render_result(res: AgentResult, role: Role) -> str:
+def render_insight(res: AgentResult, review_reasons: List[str], sources: List[str]) -> str:
     if res.error:
-        return f"_This specialist could not answer right now._ {res.error}"
+        return f"_The Insight agent could not answer right now._ {res.error}"
     o = res.output or {}
-    md = str(o.get("answer", "")).strip()
-    urgency = URGENCY_BADGE.get(str(o.get("urgency", "")).upper())
-    if role == Role.PATIENT:
-        md += _bullets("What you can do next", o.get("recommendations"))
-        if o.get("emergency_protocol"):
-            md += f"\n\n**If you have a severe reaction:** {o['emergency_protocol']}"
-    else:
-        if res.agent == AgentName.LAB:
-            md += _bullets("Abnormal values", o.get("abnormal_values")) + _bullets("Possible conditions", o.get("possible_conditions"))
-        elif res.agent == AgentName.RADIOLOGY:
-            if o.get("impression"):
-                md += f"\n\n**Impression ({o.get('study') or 'study'}):** {o['impression']}"
-            md += _bullets("Differential diagnosis", o.get("differential_diagnosis")) + _bullets("🚨 Critical findings", o.get("critical_findings"))
-        elif res.agent == AgentName.ALLERGY:
-            if o.get("risk_level"):
-                md += f"\n\n**Risk level:** {o['risk_level']}"
-            md += (_bullets("Cross-reactivities", o.get("cross_reactivities")) + _bullets("Avoid", o.get("avoid"))
-                   + _bullets("Safe alternatives", o.get("safe_alternatives")))
-            if o.get("emergency_protocol"):
-                md += f"\n\n**Emergency protocol:** {o['emergency_protocol']}"
-        elif res.agent == AgentName.COORDINATOR:
-            if o.get("care_status") and o.get("care_status") not in md:
-                md += f"\n\n**Care status:** {o['care_status']}"
-            md += (_bullets("Pending items", o.get("pending_items")) + _bullets("Specialists to involve", o.get("specialists"))
-                   + _bullets("Handoff notes", o.get("handoff_notes")))
-        md += _bullets("Recommended follow-up", o.get("recommendations"))
-    if urgency:
-        md += f"\n\n**Urgency:** {urgency}"
-    sources = o.get("sources") or res.sources
-    if sources:
-        md += f"\n\n<sub>Sources: {', '.join(dict.fromkeys(map(str, sources)))}</sub>"
+    md = ""
+    if review_reasons:
+        md += "> 🟠 **Review Required** — " + "; ".join(review_reasons) + "\n\n"
+    md += str(o.get("answer", "")).strip()
+    md += (_bullets("Key findings", o.get("key_findings")) + _bullets("Possible conditions (to confirm)", o.get("possible_conditions"))
+           + _bullets("Recommended next steps", o.get("next_steps")) + _bullets("Additional data needed", o.get("additional_data_needed")))
+    conf = o.get("confidence")
+    if isinstance(conf, (int, float)):
+        md += f"\n\n**Confidence:** {conf:.0%}"
+    srcs = list(dict.fromkeys([*map(str, o.get("sources") or []), *sources]))
+    if srcs:
+        md += f"\n\n<sub>Sources: {', '.join(srcs[:8])}</sub>"
     return md

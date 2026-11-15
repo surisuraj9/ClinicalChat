@@ -23,6 +23,9 @@ def _term_regex(term: str) -> re.Pattern:
     return re.compile(r"(?<![a-z0-9])" + re.escape(term.lower()) + r"(?![a-z0-9])")
 
 
+_NEGATED = re.compile(r"\b(no|not|without|denies|deny|never|nor)\b(?:\s+\w+){0,2}\s*$")
+
+
 def _mentions(text: str, term: str) -> bool:
     return bool(_term_regex(term).search(text))
 
@@ -156,8 +159,15 @@ class MedicalKnowledgeGraph:
         return [c for c, kws in O.CONDITION_KEYWORDS.items() if any(_mentions(t, k) for k in kws)]
 
     def symptoms_in_text(self, text: str) -> List[str]:
-        t = text.lower()
-        return [s for s in O.SYMPTOMS if _mentions(t, s)]
+        """Canonical symptoms mentioned in free text (synonyms resolved, negated mentions such as 'no fever' skipped)."""
+        t = text.lower().replace("’", "'")
+        found: List[str] = []
+        for term, canon in [*((s, s) for s in O.SYMPTOMS), *O.SYMPTOM_SYNONYMS.items()]:
+            for m in _term_regex(term).finditer(t):
+                if not _NEGATED.search(t[max(0, m.start() - 25):m.start()]):
+                    found.append(canon)
+                    break
+        return list(dict.fromkeys(found))
 
     @staticmethod
     def canonical_test(parameter: str) -> Optional[str]:

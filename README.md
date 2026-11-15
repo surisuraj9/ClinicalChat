@@ -2,71 +2,58 @@
 
 ClinicalChat is a simple, role-aware **multi-agent clinical chatbot**, built for the *AI-Driven Multi-Role Clinical Intelligence System* problem statement.
 
-You ask a question in plain English. ClinicalChat:
+It runs the **5-agent clinical workflow** from the course design:
 
-1. Routes it to the right specialist agents.
-2. Checks what your role is allowed to see.
-3. Runs the deterministic allergy and drug safety checks first.
-4. Answers in the style your role needs:
-   - **patient:** simple language
-   - **clinician:** full technical detail
-   - **radiologist:** imaging-focused
-   - **coordinator:** care coordination
+| Step | Agent | Kind | What it does |
+|---|---|---|---|
+| 1 | 📄 **Data Extraction** | rules | Parses uploads (docx/pdf/txt/xlsx/image + OCR), classifies the report, scores extraction quality, lists missing or ambiguous data, and selects the records relevant to the question. |
+| 2 | 🔬 **Clinical Analysis** | rules + KG | Contains the problem-statement specialists: **Lab Interpreter** (reference ranges, patterns), **Radiology Analyzer** (findings, red flags) and **Allergy Safety** (NetworkX cross-reactivity, drug checks). Adds a symptom → condition differential and a symptom/report consistency check. |
+| 3 | 🚨 **Risk Detection** | rules | LOW / MODERATE / HIGH / CRITICAL from critical labs, imaging red flags, red-flag symptoms and multiple conditions; decides escalation. |
+| 4 | 💡 **Insight Generation** | LLM (1 call) | Structured insight, possible conditions, next steps, missing data and a confidence score. Low confidence, missing data, contradictions or escalation → **Review required**. |
+| 5 | 💬 **Patient Communication** | LLM (1 call) | Plain-language explanation checked by a deterministic guard (no doses, no definitive diagnosis, no self-medication). **Held until a clinician validates it.** |
 
-While it works, the chat shows a live **Agent activity** panel: understanding the question → gathering records → each specialist analysing → done.
+An **agent strip** above the chat shows each agent's live state (queued, working, done, skipped, not permitted), and the chat shows a collapsible **Agent activity** log plus "🔎 What the agents found".
 
-**Which agent answered?** Three cues show this:
-- An **agent strip** above the chat has one tile per agent. Each tile shows its state: Ready, Selected, Working…, Answered · time, cached answer, Requested · not permitted, or Not for your role.
-- Each question gets a "🧭 Routed to **<agent>** · Patient: **<name>**" line.
-- Every answer is headed with the agent's name.
+### New-patient journey
 
-When a question names a patient, the patient card on the left switches to that patient.
-
-## Features
-
-| Requirement | Implementation |
-|---|---|
-| Lab Interpreter (CBC, LFT, KFT, thyroid…) | `agents.py` (`LabOutput`). Values are flagged against the printed reference ranges by code before the LLM sees them. |
-| Radiology Analyzer (X-ray, CT, MRI, US) | `agents.py` (`RadiologyOutput`): impression, differential diagnosis and critical findings. |
-| Allergy Safety (severity, cross-reactivity, emergency) | NetworkX knowledge graph (`knowledge_graph.py`, `kg_ontology.py`) plus `AllergyOutput`. |
-| Care coordination / handoff | Care Coordinator agent (`CoordinatorOutput`): status, pending items, specialists and handoff notes. |
-| Role-based routing and access | `rbac.py` and `router.py`. Patients only see their own record. Each role has its own allowed agents. |
-| Parallel agent execution | `orchestrator.py` (thread pool; results stream as each agent finishes). |
-| Safety first | Allergy and drug alerts are computed without the LLM and always shown before the answers. |
-| RAG | ChromaDB with the `all-MiniLM-L6-v2` embeddings (`vectorstore.py`), filtered by patient and domain. |
-| LangChain LCEL and Pydantic v2 | `PROMPT \| llm` chains with Pydantic output schemas and lenient JSON parsing. |
-| Audit | Every question is written to `data/audit/audit-YYYY-MM-DD.jsonl`. Optional Langfuse traces each LLM call. |
-| Gradio UI with login | One demo login per role, example questions, patient picker for staff, live agent strip, and **⬇️ Export** (one-click Markdown download). |
+1. **Sign up** at `/signup` (name, age, gender, username, password, optional allergies and medicines). Self-registered patients always get their own record — they never merge into an existing patient with the same name.
+2. **Describe symptoms** in the chat (e.g. "I have fever and cough since 3 days"). Symptoms are saved to the record.
+3. **📎 Upload reports** (CBC, X-ray report, discharge summary…). They are parsed, indexed and added to the record.
+4. The pipeline runs. **Safety and urgency guidance is shown immediately** (emergency advice is never held back); the AI explanation becomes a case **awaiting clinician review**.
+5. A clinician opens the case in the **Review queue**, adds an optional note and clicks **Approve & send** (or **Return**). The note is also stored as feedback for future Insight prompts.
+6. The patient's chat receives "✅ Reviewed by Dr. …" automatically; **My case updates** shows the status.
+7. **General health questions** ("What is CRP?") are answered directly as information, without touching the record.
 
 ### LLM budget (important with rate-limited back ends)
 
-- **Routing uses keywords only**; it makes no LLM call.
-- **Each selected agent makes exactly one LLM call.** A typical question needs 1 call, and at most 2.
+- Routing, extraction, clinical analysis and risk detection use **no LLM calls**.
+- Staff question = **1 call** (Insight). Patient case = **2 calls** (Insight + Communication). General question or "explain this to the patient" = **1 call**.
 - Responses are cached in SQLite, so asking the same question again is instant and free.
-- Some questions never reach the LLM:
-  - questions blocked by RBAC
-  - "no reports on file" cases
-  - safety checks (they are deterministic)
-- **Copilot CLI back end:**
-  - Calls run one at a time.
-  - The adapter stops at the first HTTP 429.
-  - A 2-minute circuit breaker then blocks further calls, so a rate limit never turns into a burst of retries.
+- **Copilot CLI back end:** calls run one at a time; the adapter stops at the first HTTP 429 and a 2-minute circuit breaker blocks further calls.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    U[User - login persona] --> UI[Gradio chat]
-    UI --> O[Orchestrator]
-    O --> R[Keyword router + RBAC]
-    O --> S[Deterministic safety - NetworkX KG]
-    O --> E[Engine: patient records + Chroma RAG]
-    O -->|parallel, 1 LLM call each| L[Lab Interpreter]
-    O --> RA[Radiology Analyzer]
-    O --> A[Allergy Safety]
-    O --> C[Care Coordinator]
+    U[Login / Signup] --> UI[Gradio chat]
+    UI --> O[Orchestrator + RBAC router]
+    O --> DE[1 Data Extraction]
+    DE --> CA[2 Clinical Analysis<br/>Lab · Radiology · Allergy KG]
+    CA --> RD[3 Risk Detection]
+    RD --> IG[4 Insight Generation - LLM]
+    IG --> PC[5 Patient Communication - LLM]
+    PC --> RQ[Clinician review queue]
+    RQ --> UI
+    O --> DB[(SQLite: users, uploads, cases, feedback)]
     O --> AU[Audit JSONL / Langfuse]
 ```
+
+| Role | Agents | Data |
+|---|---|---|
+| Patient | all 5 (Communication output reviewed) | own record only; can sign up and upload |
+| Clinician | 1–4, plus 5 for "explain this to the patient" | any patient; reviews patient cases |
+| Radiologist | 1–4 | imaging + allergy safety |
+| Care Coordinator | 1–4 | care summaries across specialties |
 
 ## Demo accounts
 
@@ -79,6 +66,8 @@ The password for all accounts is `demo@123` (change it with `DEMO_PASSWORD`).
 | `coord.thomas` | Care Coordinator | Care Coordinator and Allergy Safety |
 | `ananya.rao` / `rahul.mehta` | Patient | Own lab record only, simplified answers |
 | `riya.das` | Patient | Own record (sulfa allergy) |
+
+New patients can create their own account at **`/signup`** (link on the login page).
 
 These example queries from the problem statement are available as one-click suggestions:
 
@@ -118,8 +107,10 @@ Tests use a fake LLM, so they make no real calls:
 
 ```bash
 docker build -t clinicalchat .
-docker run -p 7860:7860 -e OPENAI_API_KEY=sk-... clinicalchat
+docker run -p 7860:7860 -e OPENAI_API_KEY=sk-... -v clinicalchat-state:/app/data/state clinicalchat
 ```
+
+Signed-up users, uploads, cases and review feedback live in `data/state/clinicalchat.db` (git-ignored); mount it as a volume to keep them across restarts.
 
 `GET /health` returns `{"status": "ok", ...}`; load balancers can use it for health checks.
 

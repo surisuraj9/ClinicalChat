@@ -214,6 +214,10 @@ CONDITION_KEYWORDS = {
     "Gout / hyperuricemia": ["gout", "hyperuricemia", "hyperuricaemia"],
     "Coagulopathy": ["coagulopathy", "prolonged pt", "bleeding disorder"],
     "Thrombocytopenia": ["thrombocytopenia"],
+    "Viral respiratory infection": ["viral fever", "common cold", "influenza", "flu", "upper respiratory infection", "urti"],
+    "Gastroenteritis": ["gastroenteritis", "stomach flu", "food poisoning"],
+    "Migraine": ["migraine"],
+    "Allergic skin reaction": ["urticaria", "dermatitis", "eczema", "allergic rash"],
 }
 
 # canonical test -> (regex patterns matched against lower-cased parameter names)
@@ -284,8 +288,8 @@ SYMPTOMS = {
     "shortness of breath": ["Asthma", "Pneumonia", "Anemia", "Myocardial infarction", "Anaphylaxis"],
     "breathlessness": ["Asthma", "Pneumonia", "Anemia"],
     "wheezing": ["Asthma", "Anaphylaxis"],
-    "cough": ["Asthma", "Pneumonia"],
-    "fever": ["Pneumonia", "Infection / inflammation"],
+    "cough": ["Viral respiratory infection", "Asthma", "Pneumonia"],
+    "fever": ["Viral respiratory infection", "Pneumonia", "Infection / inflammation"],
     "fatigue": ["Anemia", "Hypothyroidism", "Type 2 diabetes mellitus", "Chronic kidney disease"],
     "weakness": ["Anemia", "Hypothyroidism"],
     "pallor": ["Anemia"],
@@ -303,9 +307,40 @@ SYMPTOMS = {
     "flank pain": ["Kidney stones"],
     "abdominal pain": ["Gallstones", "Kidney stones", "Liver dysfunction"],
     "joint pain": ["Gout / hyperuricemia"],
-    "headache": ["Hypertension", "Stroke"],
+    "headache": ["Migraine", "Viral respiratory infection", "Hypertension", "Stroke"],
     "weakness on one side": ["Stroke"],
     "sweating": ["Myocardial infarction"],
+    "sore throat": ["Viral respiratory infection"],
+    "runny nose": ["Viral respiratory infection", "Allergic rhinitis"],
+    "body ache": ["Viral respiratory infection"],
+    "vomiting": ["Gastroenteritis"],
+    "nausea": ["Gastroenteritis", "Liver dysfunction"],
+    "diarrhea": ["Gastroenteritis"],
+    "dizziness": ["Anemia", "Hypertension"],
+    "fainting": ["Myocardial infarction", "Anemia"],
+    "palpitations": ["Hyperthyroidism", "Anemia"],
+    "rash": ["Allergic skin reaction"],
+    "confusion": ["Stroke"],
+    "coughing blood": ["Pneumonia"],
+}
+
+# everyday phrasing -> canonical symptom (matched with word boundaries, after negation filtering)
+SYMPTOM_SYNONYMS = {
+    "short of breath": "shortness of breath", "difficulty breathing": "shortness of breath",
+    "breathing difficulty": "shortness of breath", "can't breathe": "shortness of breath",
+    "cannot breathe": "shortness of breath", "tired": "fatigue", "tiredness": "fatigue", "exhausted": "fatigue",
+    "low energy": "fatigue", "temperature": "fever", "feverish": "fever", "throwing up": "vomiting",
+    "vomit": "vomiting", "vomited": "vomiting", "loose motion": "diarrhea", "loose motions": "diarrhea",
+    "diarrhoea": "diarrhea", "dizzy": "dizziness", "giddiness": "dizziness", "lightheaded": "dizziness",
+    "fainted": "fainting", "passed out": "fainting", "blackout": "fainting", "chest tightness": "chest pain",
+    "chest discomfort": "chest pain", "stomach pain": "abdominal pain", "stomach ache": "abdominal pain",
+    "tummy ache": "abdominal pain", "belly pain": "abdominal pain", "itching": "rash", "itchy skin": "rash",
+    "racing heart": "palpitations", "heart racing": "palpitations", "body pain": "body ache",
+    "body aches": "body ache", "muscle ache": "body ache", "muscle pain": "body ache", "throat pain": "sore throat",
+    "blocked nose": "runny nose", "stuffy nose": "runny nose", "slurred speech": "weakness on one side",
+    "face drooping": "weakness on one side", "yellow eyes": "jaundice", "yellow skin": "jaundice",
+    "coughing up blood": "coughing blood", "blood in sputum": "coughing blood", "breathless": "breathlessness",
+    "lips swelling": "swelling", "swollen": "swelling", "nauseous": "nausea", "feel sick": "nausea",
 }
 
 # condition -> (confirmatory investigations, typical treatments)
@@ -329,4 +364,8 @@ CONDITION_WORKUP = {
     "Hyperkalemia": (["ECG", "Repeat potassium"], ["Review potassium-raising drugs"]),
     "Gout / hyperuricemia": (["Serum uric acid"], ["Lifestyle modification"]),
     "Obesity": (["BMI", "Waist circumference"], ["Lifestyle modification"]),
+    "Viral respiratory infection": (["Clinical examination", "CBC", "CRP"], ["Rest and fluids", "paracetamol"]),
+    "Gastroenteritis": (["Clinical examination", "Stool test", "Electrolytes"], ["Oral rehydration"]),
+    "Migraine": (["Clinical examination"], ["Headache diary", "paracetamol"]),
+    "Allergic skin reaction": (["Clinical examination", "Skin prick test"], ["cetirizine", "Allergen avoidance"]),
 }

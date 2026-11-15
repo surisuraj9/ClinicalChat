@@ -11,6 +11,7 @@ from clinicalchat.audit import Auditor
 from clinicalchat.config import Settings
 from clinicalchat.engine import ClinicalEngine
 from clinicalchat.orchestrator import Orchestrator
+from clinicalchat.store import Store
 
 
 class FakeLLM(BaseChatModel):
@@ -26,14 +27,19 @@ class FakeLLM(BaseChatModel):
         text = "\n".join(str(m.content) for m in messages)
         self.calls.append(text)
         agent = re.search(r"You are the ([A-Z ]+) agent", text).group(1)
-        payload = {"answer": f"{agent} answer", "key_findings": ["finding"], "recommendations": ["repeat test"],
-                   "urgency": "ROUTINE", "sources": []}
+        if agent.startswith("INSIGHT"):
+            payload = {"answer": "INSIGHT answer", "key_findings": ["finding"], "possible_conditions": ["Anaemia"],
+                       "next_steps": ["repeat test"], "additional_data_needed": [], "confidence": 0.8, "sources": []}
+        else:
+            payload = {"message": "COMMUNICATION answer. Please discuss this with your doctor.",
+                       "what_it_means": ["meaning"], "next_steps": ["rest"], "seek_help_if": ["worse"],
+                       "questions_for_doctor": ["what next?"]}
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content="```json\n" + json.dumps(payload) + "\n```"))])
 
 
 @pytest.fixture(scope="session")
 def engine():
-    return ClinicalEngine()
+    return ClinicalEngine(persist=False)
 
 
 @pytest.fixture()
@@ -42,5 +48,10 @@ def fake_llm():
 
 
 @pytest.fixture()
-def orch(engine, fake_llm, tmp_path):
-    return Orchestrator(engine, llm=fake_llm, auditor=Auditor(Settings(work_dir=tmp_path)))
+def store(tmp_path):
+    return Store(path=tmp_path / "test.db")
+
+
+@pytest.fixture()
+def orch(engine, fake_llm, store, tmp_path):
+    return Orchestrator(engine, llm=fake_llm, auditor=Auditor(Settings(work_dir=tmp_path)), store=store)

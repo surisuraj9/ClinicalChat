@@ -1,10 +1,12 @@
-"""Role-based access control: which agents a role may use, what data it may see and how answers are written."""
+"""Role-based access control: which agents run for a role, which record domains it may see and how answers are written."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
 from typing import FrozenSet, Optional
+
+from clinicalchat.models import Domain
 
 
 class Role(str, Enum):
@@ -15,18 +17,24 @@ class Role(str, Enum):
 
 
 class AgentName(str, Enum):
-    LAB = "lab"
-    RADIOLOGY = "radiology"
-    ALLERGY = "allergy"
-    COORDINATOR = "coordinator"
+    EXTRACTION = "extraction"
+    ANALYSIS = "analysis"
+    RISK = "risk"
+    INSIGHT = "insight"
+    COMMUNICATION = "communication"
 
 
 AGENT_LABELS = {
-    AgentName.LAB: "🧪 Lab Interpreter",
-    AgentName.RADIOLOGY: "🩻 Radiology Analyzer",
-    AgentName.ALLERGY: "⚠️ Allergy Safety",
-    AgentName.COORDINATOR: "🗂️ Care Coordinator",
+    AgentName.EXTRACTION: "📄 Data Extraction",
+    AgentName.ANALYSIS: "🔬 Clinical Analysis",
+    AgentName.RISK: "🚨 Risk Detection",
+    AgentName.INSIGHT: "💡 Insight Generation",
+    AgentName.COMMUNICATION: "💬 Patient Communication",
 }
+AGENT_ORDER = list(AgentName)
+LLM_AGENTS = frozenset({AgentName.INSIGHT, AgentName.COMMUNICATION})
+
+ALL_DOMAINS = frozenset(Domain)
 
 
 @dataclass(frozen=True)
@@ -34,40 +42,42 @@ class RolePolicy:
     role: Role
     label: str
     agents: FrozenSet[AgentName]
+    domains: FrozenSet[Domain]
     own_record_only: bool
+    can_review: bool
+    can_upload: bool
     audience: str
 
 
+_STAFF_AGENTS = frozenset({AgentName.EXTRACTION, AgentName.ANALYSIS, AgentName.RISK, AgentName.INSIGHT})
+
 POLICIES = {
     Role.PATIENT: RolePolicy(
-        role=Role.PATIENT, label="Patient",
-        agents=frozenset({AgentName.LAB, AgentName.RADIOLOGY, AgentName.ALLERGY}),
-        own_record_only=True,
+        role=Role.PATIENT, label="Patient", agents=frozenset(AgentName), domains=ALL_DOMAINS,
+        own_record_only=True, can_review=False, can_upload=True,
         audience=("PATIENT. Use plain, reassuring, simple language (short sentences, no jargon — explain any medical "
                   "term you must use). Do NOT give drug doses, prescriptions or a definitive diagnosis. Explain what "
-                  "the results mean in everyday terms and always suggest discussing them with their doctor. Clearly "
-                  "say when something needs urgent medical attention."),
+                  "things mean in everyday terms and always suggest discussing them with their doctor. Clearly say "
+                  "when something needs urgent medical attention."),
     ),
     Role.CLINICIAN: RolePolicy(
-        role=Role.CLINICIAN, label="Clinician",
-        agents=frozenset(AgentName),
-        own_record_only=False,
+        role=Role.CLINICIAN, label="Clinician", agents=frozenset(AgentName), domains=ALL_DOMAINS,
+        own_record_only=False, can_review=True, can_upload=True,
         audience=("CLINICIAN. Give full technical detail: exact values with reference ranges, clinical patterns, "
                   "differential diagnosis, treatment considerations and recommended follow-up tests. Be concise and "
                   "structured."),
     ),
     Role.RADIOLOGIST: RolePolicy(
-        role=Role.RADIOLOGIST, label="Radiologist",
-        agents=frozenset({AgentName.RADIOLOGY, AgentName.ALLERGY}),
-        own_record_only=False,
+        role=Role.RADIOLOGIST, label="Radiologist", agents=_STAFF_AGENTS,
+        domains=frozenset({Domain.RADIOLOGY, Domain.ALLERGY, Domain.REFERENCE}),
+        own_record_only=False, can_review=False, can_upload=False,
         audience=("RADIOLOGIST. Focus on imaging: technique, findings by region, impression, differential diagnosis, "
                   "critical findings, comparison/further imaging recommendations and contrast-safety considerations. "
                   "Use precise radiology terminology."),
     ),
     Role.COORDINATOR: RolePolicy(
-        role=Role.COORDINATOR, label="Care Coordinator",
-        agents=frozenset({AgentName.COORDINATOR, AgentName.ALLERGY}),
-        own_record_only=False,
+        role=Role.COORDINATOR, label="Care Coordinator", agents=_STAFF_AGENTS, domains=ALL_DOMAINS,
+        own_record_only=False, can_review=False, can_upload=False,
         audience=("CARE COORDINATOR. Focus on care coordination across specialties: current status, outstanding "
                   "results/tests, which specialists need to be involved, follow-up scheduling, safety alerts to hand "
                   "over and next actions. Avoid deep technical interpretation; be operational and concise."),
@@ -81,6 +91,10 @@ def policy(role: Role | str) -> RolePolicy:
 
 def can_use(role: Role | str, agent: AgentName) -> bool:
     return agent in policy(role).agents
+
+
+def can_see(role: Role | str, domain: Domain) -> bool:
+    return domain in policy(role).domains
 
 
 def can_access_patient(role: Role | str, own_patient_key: Optional[str], patient_key: Optional[str]) -> bool:

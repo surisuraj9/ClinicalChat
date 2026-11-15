@@ -1,4 +1,11 @@
-"""Specialist agents: one LCEL chain (prompt | llm | parser) and exactly one LLM call per agent."""
+"""LLM agents (LangChain LCEL, exactly one LLM call each, cached):
+
+* 💡 Insight Generation Agent — consolidates the deterministic Extraction / Analysis / Risk outputs and the records into
+  a structured, actionable clinical insight (+ confidence). Low confidence / missing data / contradictions ->
+  "Review Required".
+* 💬 Patient Communication Agent — turns the clinical insight into a plain-language explanation for the patient (or
+  answers a general health question); a deterministic guard checks doses, definitive diagnoses and over-reassurance.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +13,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, Iterable, List, Optional, Type
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -17,89 +24,77 @@ from clinicalchat.rbac import AGENT_LABELS, AgentName
 
 log = logging.getLogger(__name__)
 
-URGENCY = "ROUTINE | SOON | URGENT | EMERGENCY"
-
 
 # ---------------------------------------------------------------- structured outputs (Pydantic v2)
-class AgentOutput(BaseModel):
+class InsightOutput(BaseModel):
     answer: str = Field(description="Direct answer to the question for the stated audience (markdown, 80-220 words)")
-    key_findings: List[str] = Field(default_factory=list, description="Most important findings, each one short line")
-    recommendations: List[str] = Field(default_factory=list, description="Recommended follow-up tests / next steps")
-    urgency: str = Field(default="ROUTINE", description=URGENCY)
-    sources: List[str] = Field(default_factory=list, description="File names of records used")
+    key_findings: List[str] = Field(default_factory=list, description="Most important findings, one short line each")
+    possible_conditions: List[str] = Field(default_factory=list, description="Conditions the findings may suggest (not a diagnosis)")
+    next_steps: List[str] = Field(default_factory=list, description="Recommended follow-up tests / actions")
+    additional_data_needed: List[str] = Field(default_factory=list, description="Information that is missing to be confident")
+    confidence: float = Field(default=0.7, description="Your confidence in this insight, number between 0 and 1")
+    sources: List[str] = Field(default_factory=list, description="File names of the records used")
 
 
-class LabOutput(AgentOutput):
-    abnormal_values: List[str] = Field(default_factory=list, description="'<parameter>: <value> (<ref range>) HIGH/LOW'")
-    possible_conditions: List[str] = Field(default_factory=list, description="Conditions the pattern may suggest")
+class CommunicationOutput(BaseModel):
+    message: str = Field(description="Plain-language explanation for the patient (60-180 words, short sentences, no jargon)")
+    what_it_means: List[str] = Field(default_factory=list, description="2-4 simple bullet points")
+    next_steps: List[str] = Field(default_factory=list, description="What the patient can do next (no medicine doses)")
+    seek_help_if: List[str] = Field(default_factory=list, description="Warning signs that need urgent care")
+    questions_for_doctor: List[str] = Field(default_factory=list, description="Useful questions to ask their doctor")
 
 
-class RadiologyOutput(AgentOutput):
-    study: str = Field(default="", description="Modality and body region, e.g. 'CT Chest'")
-    impression: str = ""
-    differential_diagnosis: List[str] = Field(default_factory=list)
-    critical_findings: List[str] = Field(default_factory=list, description="Findings that need urgent communication")
-
-
-class AllergyOutput(AgentOutput):
-    risk_level: str = Field(default="NONE", description="NONE | LOW | MODERATE | HIGH | CRITICAL")
-    cross_reactivities: List[str] = Field(default_factory=list)
-    avoid: List[str] = Field(default_factory=list, description="Drugs/foods/substances to avoid")
-    safe_alternatives: List[str] = Field(default_factory=list)
-    emergency_protocol: str = Field(default="", description="What to do if a severe reaction occurs")
-
-
-class CoordinatorOutput(AgentOutput):
-    care_status: str = Field(default="", description="One-paragraph current status across specialties")
-    pending_items: List[str] = Field(default_factory=list, description="Outstanding results, tests or decisions")
-    specialists: List[str] = Field(default_factory=list, description="Specialties/teams that should be involved")
-    handoff_notes: List[str] = Field(default_factory=list, description="Critical points for the receiving team (SBAR style)")
-
-
-SYSTEM_PROMPTS: Dict[AgentName, str] = {
-    AgentName.LAB: ("You are the LAB INTERPRETER agent. You interpret CBC, liver (LFT), kidney (KFT), thyroid, blood "
-                    "sugar, cardiac/lipid and BMI results: flag abnormal values against the given reference ranges, "
-                    "explain clinical significance, identify patterns across tests and recommend follow-up tests."),
-    AgentName.RADIOLOGY: ("You are the RADIOLOGY ANALYZER agent. You review X-ray, CT, MRI and ultrasound reports: "
-                          "summarise findings by region, give the impression, a differential diagnosis, flag critical "
-                          "findings and recommend further imaging or correlation."),
-    AgentName.ALLERGY: ("You are the ALLERGY SAFETY agent. You check medications/foods against the patient's documented "
-                        "allergies, explain cross-reactivity, severity and contraindications, propose safe alternatives "
-                        "and state the emergency protocol (e.g. anaphylaxis: IM adrenaline 0.5 mg, call emergency "
-                        "services). Patient safety overrides everything else."),
-    AgentName.COORDINATOR: ("You are the CARE COORDINATOR agent. You give a cross-specialty view of the patient (labs, "
-                            "imaging, allergies, medications, conditions): current care status, pending items, which "
-                            "specialists to involve, follow-up scheduling and a concise handoff summary."),
-}
-OUTPUT_MODELS: Dict[AgentName, Type[AgentOutput]] = {
-    AgentName.LAB: LabOutput, AgentName.RADIOLOGY: RadiologyOutput,
-    AgentName.ALLERGY: AllergyOutput, AgentName.COORDINATOR: CoordinatorOutput,
-}
+INSIGHT_SYSTEM = (
+    "You are the INSIGHT GENERATION agent of a clinical decision-support system. Upstream agents have already run: "
+    "DATA EXTRACTION (which records were found, their quality, missing data), CLINICAL ANALYSIS (lab values vs "
+    "reference ranges, imaging findings, allergy/drug safety, symptom differential, inconsistencies) and RISK "
+    "DETECTION (rule-based risk level). Consolidate their outputs and the records into clear, actionable insight "
+    "that answers the question. Recommend next steps (tests, referrals, follow-up). State what additional data "
+    "would be needed and give an honest confidence.")
+COMMUNICATION_SYSTEM = (
+    "You are the PATIENT COMMUNICATION agent. Translate the clinical insight below into a short, warm, plain-language "
+    "explanation for the patient. Keep it informational, never diagnostic: say what the findings MAY mean, not what the "
+    "patient HAS. Never give medicine names with doses, never tell them to start/stop medicines, never be "
+    "over-reassuring when results are abnormal. Always encourage discussing with their doctor. Follow the risk "
+    "guidance exactly (if it says emergency, say so first).")
+GENERAL_SYSTEM = (
+    "You are the PATIENT COMMUNICATION agent answering a general health question from a patient. Give accurate, "
+    "general, educational information in plain language using the reference material when relevant. Do not diagnose, "
+    "do not give medicine doses. If the patient's documented allergies are relevant, mention them. If the question "
+    "is not about health or medicine, politely say you can only help with health questions. Encourage seeing a "
+    "doctor for personal medical advice.")
 
 GROUND_RULES = """Ground rules:
-- Use ONLY the patient profile, deterministic facts and records below. If information is missing, say so. Never invent values, dates or patients.
-- DETERMINISTIC FACTS were computed by validated code (reference-range flags, knowledge-graph allergy checks): never contradict them.
+- Use ONLY the information provided. If something is missing, say so. Never invent values, dates, patients or reports.
+- DETERMINISTIC FINDINGS and RISK were computed by validated code (reference ranges, knowledge graph, safety rules): never contradict them.
 - Allergy and drug-safety information takes priority over everything else.
 - You support, not replace, clinical judgement."""
 
-PROMPT = ChatPromptTemplate.from_messages([
+INSIGHT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", "{system}\n\n{rules}\n\nAUDIENCE: {audience}\n\n"
                "Reply with ONE JSON object only — no text before or after — with these keys:\n{schema}"),
     ("human", "CONVERSATION SO FAR:\n{history}\n\nQUESTION:\n{question}\n\nPATIENT PROFILE:\n{patient}\n\n"
-              "DETERMINISTIC FACTS:\n{facts}\n\nRECORDS:\n{context}"),
+              "DATA EXTRACTION:\n{extraction}\n\nDETERMINISTIC FINDINGS (Clinical Analysis):\n{facts}\n\n"
+              "RISK (Risk Detection):\n{risk}\n\nLESSONS FROM CLINICIAN REVIEWS:\n{feedback}\n\nRECORDS:\n{context}"),
+])
+COMMUNICATION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "{system}\n\n{rules}\n\nReply with ONE JSON object only — no text before or after — with these keys:\n{schema}"),
+    ("human", "PATIENT'S QUESTION:\n{question}\n\nPATIENT:\n{patient}\n\nRISK GUIDANCE:\n{risk}\n\n"
+              "CLINICAL INSIGHT / REFERENCE MATERIAL:\n{insight}"),
 ])
 
 
 def schema_hint(model: Type[BaseModel]) -> str:
     lines = []
     for name, f in model.model_fields.items():
-        kind = "list of strings" if "List" in str(f.annotation) else "string"
+        ann = str(f.annotation)
+        kind = "list of strings" if "List" in ann else "number" if "float" in ann else "string"
         lines.append(f'- "{name}" ({kind}){": " + f.description if f.description else ""}')
     return "\n".join(lines)
 
 
-def parse_output(raw: str, model: Type[AgentOutput]) -> tuple[AgentOutput, bool]:
-    """Lenient JSON extraction; falls back to using the raw text as the answer (never a second LLM call)."""
+def parse_output(raw: str, model: Type[BaseModel], text_field: str) -> tuple[BaseModel, bool]:
+    """Lenient JSON extraction; falls back to the raw text (never a second LLM call)."""
     text = raw.strip()
     m = re.search(r"\{.*\}", text, re.S)
     if m:
@@ -107,15 +102,24 @@ def parse_output(raw: str, model: Type[AgentOutput]) -> tuple[AgentOutput, bool]
             data = json.loads(m.group(0))
             if isinstance(data, dict):
                 for k, v in list(data.items()):
-                    if k in model.model_fields and "List" in str(model.model_fields[k].annotation) and isinstance(v, str):
-                        data[k] = [v] if v else []
-                    elif isinstance(v, list) and k in model.model_fields and "List" in str(model.model_fields[k].annotation):
-                        data[k] = [x if isinstance(x, str) else json.dumps(x) if not isinstance(x, dict) else
-                                   " — ".join(str(y) for y in x.values()) for x in v]
+                    if k not in model.model_fields:
+                        continue
+                    ann = str(model.model_fields[k].annotation)
+                    if "List" in ann:
+                        if isinstance(v, str):
+                            data[k] = [v] if v else []
+                        elif isinstance(v, list):
+                            data[k] = [x if isinstance(x, str) else " — ".join(map(str, x.values())) if isinstance(x, dict)
+                                       else str(x) for x in v]
+                    elif "float" in ann:
+                        try:
+                            data[k] = max(0.0, min(1.0, float(str(v).strip("%")) / (100 if float(str(v).strip("%")) > 1 else 1)))
+                        except ValueError:
+                            data.pop(k)
                 return model.model_validate(data), True
         except (json.JSONDecodeError, ValidationError) as exc:
             log.warning("Could not parse agent JSON: %s", str(exc)[:200])
-    return model(answer=text.strip("`") or "No answer was produced."), False
+    return model(**{text_field: text.strip("`") or "No answer was produced."}), False
 
 
 class AgentResult(BaseModel):
@@ -126,34 +130,95 @@ class AgentResult(BaseModel):
     error: str = ""
     latency_ms: int = 0
     cache_hit: bool = False
-    sources: List[str] = Field(default_factory=list)
 
 
-class SpecialistAgent:
-    def __init__(self, name: AgentName, llm: BaseChatModel):
-        self.name = name
-        self.label = AGENT_LABELS[name]
-        self.output_model = OUTPUT_MODELS[name]
+class _LLMAgent:
+    name: AgentName
+    output_model: Type[BaseModel]
+    text_field: str
+
+    def __init__(self, llm: BaseChatModel, prompt: ChatPromptTemplate):
         self.llm = llm
-        self.chain = PROMPT | llm  # LCEL; StrOutputParser applied after so cache metadata stays visible
+        self.label = AGENT_LABELS[self.name]
+        self.chain = prompt | llm  # LCEL; parsing happens after so cache metadata stays visible
 
-    def run(self, *, question: str, audience: str, patient: str, facts: str, context: str, history: str,
-            sources: List[str], config: Optional[dict] = None) -> AgentResult:
+    def _invoke(self, variables: Dict[str, Any], config: Optional[dict]) -> AgentResult:
         start = time.perf_counter()
-        result = AgentResult(agent=self.name, label=self.label, sources=sources)
+        result = AgentResult(agent=self.name, label=self.label)
         try:
-            message = self.chain.invoke({
-                "system": SYSTEM_PROMPTS[self.name], "rules": GROUND_RULES, "audience": audience,
-                "schema": schema_hint(self.output_model), "history": history or "None.", "question": question,
-                "patient": patient, "facts": facts or "None.", "context": context,
-            }, config={**(config or {}), "run_name": self.label, "metadata": {"agent": self.name.value}})
+            message = self.chain.invoke({"rules": GROUND_RULES, "schema": schema_hint(self.output_model), **variables},
+                                        config={**(config or {}), "run_name": self.label,
+                                                "metadata": {**(config or {}).get("metadata", {}), "agent": self.name.value}})
             result.cache_hit = bool((getattr(message, "response_metadata", None) or {}).get("cache_hit"))
-            output, ok = parse_output(StrOutputParser().invoke(message), self.output_model)
+            output, ok = parse_output(StrOutputParser().invoke(message), self.output_model, self.text_field)
             result.output, result.parsed = output.model_dump(), ok
-            if not output.sources:
-                result.output["sources"] = sources
-        except Exception as exc:  # backend failure must not crash the chat
+        except Exception as exc:  # a backend failure must not crash the chat
             log.exception("%s failed", self.name.value)
             result.error = str(exc)[:400]
         result.latency_ms = int((time.perf_counter() - start) * 1000)
         return result
+
+
+class InsightGenerationAgent(_LLMAgent):
+    name = AgentName.INSIGHT
+    output_model = InsightOutput
+    text_field = "answer"
+
+    def __init__(self, llm: BaseChatModel):
+        super().__init__(llm, INSIGHT_PROMPT)
+
+    def run(self, *, question: str, audience: str, patient: str, extraction: str, facts: str, risk: str, feedback: str,
+            context: str, history: str, config: Optional[dict] = None) -> AgentResult:
+        return self._invoke({"system": INSIGHT_SYSTEM, "audience": audience, "question": question, "patient": patient,
+                             "extraction": extraction, "facts": facts, "risk": risk, "feedback": feedback or "None.",
+                             "context": context, "history": history or "None."}, config)
+
+
+class PatientCommunicationAgent(_LLMAgent):
+    name = AgentName.COMMUNICATION
+    output_model = CommunicationOutput
+    text_field = "message"
+
+    def __init__(self, llm: BaseChatModel):
+        super().__init__(llm, COMMUNICATION_PROMPT)
+
+    def run(self, *, question: str, patient: str, risk: str, insight: str, general: bool = False,
+            config: Optional[dict] = None) -> AgentResult:
+        return self._invoke({"system": GENERAL_SYSTEM if general else COMMUNICATION_SYSTEM, "question": question,
+                             "patient": patient, "risk": risk, "insight": insight}, config)
+
+
+# ---------------------------------------------------------------- patient-text guard (deterministic)
+_DOSE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:mg|mcg|µg|g|ml|units?|iu)\b(?:\s*(?:once|twice|daily|a day|per day|bd|od|tds))?", re.I)
+_DEFINITIVE = re.compile(r"\byou (?:definitely |certainly )?(?:have|are suffering from|are diagnosed with) "
+                         r"(?:cancer|a tumou?r|leukaemia|leukemia|kidney failure|heart failure|a stroke|diabetes|hiv|pneumonia)\b", re.I)
+_SELF_MED = re.compile(r"\b(stop|start|double|increase|decrease) (?:taking )?(?:your |the )?(?:medicine|medication|tablets?|insulin|dose)\b", re.I)
+_REASSURE = re.compile(r"\b(nothing to worry about|completely normal|no need to see (?:a|your) doctor)\b", re.I)
+
+
+def check_patient_text(parts: Iterable[str], has_abnormal: bool) -> List[str]:
+    text = "\n".join(p for p in parts if p)
+    issues: List[str] = []
+    if _DOSE.search(text):
+        issues.append("Contains medication doses — patient messages must not include dosing")
+    if _DEFINITIVE.search(text):
+        issues.append("States a definitive diagnosis — must stay informational until a clinician confirms")
+    if _SELF_MED.search(text):
+        issues.append("Suggests changing medication without a clinician")
+    if has_abnormal and _REASSURE.search(text):
+        issues.append("Over-reassuring wording although abnormal findings are present")
+    if "doctor" not in text.lower() and "clinician" not in text.lower():
+        issues.append("Does not direct the patient to discuss with their doctor")
+    return issues
+
+
+def communication_markdown(o: Dict[str, Any]) -> str:
+    md = str(o.get("message", "")).strip()
+    md += _bullets("What this may mean", o.get("what_it_means")) + _bullets("What you can do next", o.get("next_steps"))
+    md += _bullets("Get urgent help if", o.get("seek_help_if")) + _bullets("Questions to ask your doctor", o.get("questions_for_doctor"))
+    return md
+
+
+def _bullets(title: str, items) -> str:
+    items = [i for i in (items or []) if str(i).strip()]
+    return f"\n\n**{title}**\n" + "\n".join(f"- {i}" for i in items) if items else ""
