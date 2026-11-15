@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from clinicalchat.agents import InsightOutput, check_patient_text, parse_output
 from clinicalchat.export import session_markdown
 from clinicalchat.orchestrator import ChatSession
@@ -38,9 +40,13 @@ def test_patient_case_is_held_for_clinician_review(orch, fake_llm, store):
     case_ev = next(e for e in events if e.kind == "case")
     assert answer.data["case_id"] == case_ev.data["case_id"] and case_ev.data["case_id"] in case_ev.text
     case = store.case(case_ev.data["case_id"])
-    assert case["status"] == "PENDING_REVIEW" and "COMMUNICATION answer" in case["patient_draft"]
+    # no imaging -> straight to the care coordinator (not the radiologist)
+    assert case["status"] == "AWAITING_TRIAGE" and "COMMUNICATION answer" in case["patient_draft"]
     assert store.undelivered("ananya-rao-54") == []
+    with pytest.raises(ValueError):  # a clinician cannot confirm a case before it has been triaged
+        orch.review(case["case_id"], "Dr. Neha Sharma", approve=True)
 
+    orch.triage(case["case_id"], "Maria Thomas", "Soon", "dr.sharma")
     orch.review(case["case_id"], "Dr. Neha Sharma", approve=True, note="Iron studies booked.")
     delivered = store.undelivered("ananya-rao-54")
     assert len(delivered) == 1 and "Iron studies booked." in delivered[0]["final_message"]
@@ -58,6 +64,7 @@ def test_one_open_case_per_patient_is_updated_not_duplicated(orch, fake_llm, sto
     cases = store.cases(patient_key="rahul-mehta-32")
     assert len(cases) == 1 and [h["question"] for h in cases[0]["payload"]["history"]] == [
         "Explain my thyroid results", "Based on my reports what is my current health condition?"]
+    orch.triage(first.data["case_id"], "Maria Thomas", "Routine", "dr.sharma")
     orch.review(first.data["case_id"], "Dr. Neha Sharma", approve=True)  # closed -> the next question opens a new case
     third = next(e for e in orch.run("I have a headache since yesterday", s) if e.kind == "case")
     assert third.data["case_id"] != first.data["case_id"] and not third.data["updated"]
@@ -68,7 +75,7 @@ def test_duplicate_open_cases_are_consolidated(store):
     a = store.create_case(patient_key="p-1", question="q1", risk_level="HIGH", **kw)
     b = store.create_case(patient_key="p-1", question="q2", risk_level="LOW", **kw)
     assert store.consolidate_open_cases() == 1
-    open_ = [c for c in store.cases(patient_key="p-1") if c["status"] == "PENDING_REVIEW"]
+    open_ = [c for c in store.cases(patient_key="p-1") if c["status"] == "AWAITING_TRIAGE"]
     assert len(open_) == 1 and open_[0]["risk_level"] == "HIGH"
     assert {open_[0]["case_id"]} < {a, b} and len(open_[0]["payload"]["history"]) == 2
     assert store.undelivered("p-1") == []  # merged case is not pushed to the patient
@@ -233,3 +240,56 @@ def test_patient_text_guard():
     assert any("definitive" in i for i in check_patient_text(["You have cancer. Talk to your doctor."], True))
     assert any("Over-reassuring" in i for i in check_patient_text(["Nothing to worry about, see your doctor."], True))
     assert check_patient_text(["Your haemoglobin is a little low. Please discuss it with your doctor."], True) == []
+
+
+def test_imaging_case_goes_radiologist_then_coordinator_then_assigned_clinician(orch, fake_llm, store):
+    s = _session(Role.PATIENT, own="meera-nair-47", username="meera")
+    case_id = next(e for e in orch.run("Explain my CT scan report", s) if e.kind == "case").data["case_id"]
+    case = store.case(case_id)
+    assert case["status"] == "AWAITING_RADIOLOGY" and case["payload"]["imaging"]
+    assert "contrast_alerts" in case["payload"] and "radiologist" in next(
+        e for e in orch.run("what is the status of my case?", s) if e.kind == "answer").text.lower()
+    with pytest.raises(ValueError):
+        orch.triage(case_id, "Maria Thomas", "Soon", "dr.sharma")  # coordinator waits for the radiology read
+
+    case = orch.radiology_read(case_id, "Dr. Arjun Iyer", "Agree with AI imaging findings", "")
+    assert case["status"] == "AWAITING_TRIAGE" and case["payload"]["radiology"]["doc_ids"]
+    with pytest.raises(ValueError):
+        orch.triage(case_id, "Maria Thomas", "Soon", "dr.iyer")  # only clinicians can be assigned
+    case = orch.triage(case_id, "Maria Thomas", "Urgent", "dr.menon", "Please see today")
+    assert case["status"] == "PENDING_REVIEW" and case["payload"]["triage"]["clinician_name"] == "Dr. Kavya Menon"
+
+    orch.review(case_id, "Dr. Kavya Menon", approve=False, note="How long have you had the headache?")
+    assert store.case(case_id)["status"] == "RETURNED"
+    # the patient answers -> same case goes straight back to the assigned clinician (imaging already read)
+    again = next(e for e in orch.run("The headache started 3 days ago and is getting worse", s) if e.kind == "case")
+    case = store.case(case_id)
+    assert again.data["case_id"] == case_id and case["status"] == "PENDING_REVIEW"
+    assert case["payload"]["triage"]["clinician"] == "dr.menon" and len(case["payload"]["radiology"]["reads"]) == 1
+    assert [e["actor"] for e in case["payload"]["timeline"]][:2] == ["Patient", "System"]
+
+
+def test_critical_radiology_read_raises_risk_and_goes_back_to_triage(orch, fake_llm, store):
+    s = _session(Role.PATIENT, own="meera-nair-47", username="meera")
+    case_id = next(e for e in orch.run("Explain my CT scan report", s) if e.kind == "case").data["case_id"]
+    case = orch.radiology_read(case_id, "Dr. Arjun Iyer", "Critical finding — urgent", "Acute bleed — needs urgent review")
+    assert case["status"] == "AWAITING_TRIAGE" and case["risk_level"] == "CRITICAL"
+
+
+def test_case_status_question_uses_no_llm(orch, fake_llm, store):
+    s = _session(Role.PATIENT, own="rahul-mehta-32", username="rahul.mehta")
+    events = orch.run("Has the doctor reviewed my case?", s)
+    answer = next(e for e in events if e.kind == "answer")
+    assert fake_llm.calls == [] and "don't have a case yet" in answer.text
+    orch.run("Explain my thyroid results", s)
+    n = len(fake_llm.calls)
+    answer = next(e for e in orch.run("what is the status of my case?", s) if e.kind == "answer")
+    assert len(fake_llm.calls) == n and "care coordinator" in answer.text.lower()
+
+
+def test_iodine_allergy_flags_contrast_for_radiologist(orch, fake_llm, engine, store):
+    key = engine.new_patient_key("Iodine Allergic", 40)
+    engine.create_patient(key, "Iodine Allergic", 40, "Female")
+    engine.apply_fact(key, "allergy", "iodine")
+    alerts = engine.safety_alerts(key, ["iodinated contrast"])
+    assert alerts and alerts[0].level == "CONTRAINDICATED"

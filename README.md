@@ -20,10 +20,31 @@ An **agent strip** above the chat shows each agent's live state (queued, working
 2. **Describe symptoms** in the chat (e.g. "I have fever and cough since 3 days"). Symptoms are saved to the record.
 3. **📎 Attach reports** (up to 10 at once — PDF, Word, Excel, text or a photo/scan) and press **Send**, with or without a message such as *"I have fever for 4 days — here are my reports, can I take ibuprofen?"* — each attached file shows as a chip with its own × to remove it before sending. Each file is checked on its own (unreadable files, duplicates and reports carrying **another person's name** are not added); the accepted reports and the message then go through **one** pipeline run — the same LLM cost as a single question.
 4. The pipeline runs. **Safety and urgency guidance** and the **AI assessment of the current health condition** (risk level, possible conditions — clearly not a diagnosis — and a plain-language explanation) are shown immediately, together with a **case ID**.
-   - **One open case per patient:** follow-up questions and new reports update the same case (the clinician sees the full message history and the risk level never drops before review). A new case is opened only after the clinician has closed the previous one.
-5. A clinician opens the case in the **Review queue**, adds an optional note and clicks **Approve & send** (or **Return**). The note is also stored as feedback for future Insight prompts.
-6. The patient's chat receives "✅ Case C-… confirmed by Dr. …" automatically; **My case updates** shows the status.
+   - **One open case per patient:** follow-up questions and new reports update the same case (the care team sees the full message history and the risk level never drops before review). A new case is opened only after the clinician has closed the previous one.
+5. The case moves through the **care team** (see below). The patient's **My case updates** tile shows a step tracker, and *"What is the status of my case?"* is answered from the workflow (no LLM call).
+6. The patient's chat receives "✅ Case C-… confirmed by Dr. …" or "↩️ … needs more information" automatically. A reply goes into the same case.
 7. **General health questions** ("What is CRP?") are answered directly as information, without touching the record.
+
+### Care-team workflow (role-based)
+
+```
+Patient case ──► 🩻 Radiologist ──► 🧭 Care Coordinator ──► 👩‍⚕️ Assigned clinician ──► ✅ Confirmed
+ (AI assessment   only if the case    sets priority            confirms, or ↩️ asks the
+  shown at once)  has unread imaging  (Urgent/Soon/Routine)    patient for more info
+                                      + assigns a clinician
+```
+
+| Stage | Who | Queue | Sees | Action |
+|---|---|---|---|---|
+| 🩻 With radiologist | `dr.iyer` | **Imaging queue** | Imaging reports, extracted impression / red flags, allergies + **iodinated-contrast check** (no lab results — RBAC) | Verdict (agree / additional findings / **critical**) + written read → **Submit read** |
+| 🧭 With care coordinator | `coord.thomas` | **Triage queue** + case board | Risk flags, report types, AI possibilities and next steps, radiology read; suggested priority from risk | Priority + assigned clinician + hand-off note → **Route to clinician** |
+| ⏳ With clinician | assigned clinician (`dr.sharma` / `dr.menon`) | **Review queue** (only cases assigned to them) | Full findings, AI insight, radiology read, triage note, text shown to the patient | **Approve & send** or **Return** (note is reused as Insight feedback) |
+
+Routing rules:
+- Imaging (X-ray, CT, MRI, ultrasound) not yet read by a radiologist → radiologist first. **Allergy-only reports do not go to the radiologist**; the radiologist sees allergies only to judge contrast safety.
+- A **critical** radiology read raises the case to CRITICAL and sends it back to triage, even if it was already assigned.
+- A patient reply to a returned case goes straight back to the assigned clinician, unless it adds new imaging (then radiologist first).
+- Each stage is checked server-side (a clinician cannot confirm an un-triaged case, the coordinator cannot triage before the radiology read, and only clinicians can be assigned). Every step is written to the case timeline and the audit log.
 
 ### LLM budget (important with rate-limited back ends)
 
@@ -62,9 +83,9 @@ The password for all accounts is `demo@123` (change it with `DEMO_PASSWORD`).
 
 | Username | Role | Notes |
 |---|---|---|
-| `dr.sharma` | Clinician | All agents, any patient |
-| `dr.iyer` | Radiologist | Radiology and Allergy Safety (contrast safety) |
-| `coord.thomas` | Care Coordinator | Care Coordinator and Allergy Safety |
+| `dr.sharma` / `dr.menon` | Clinician | All agents, any patient; **Review queue** for cases assigned to them |
+| `dr.iyer` | Radiologist | Imaging and allergy (contrast safety) records only; **Imaging queue** |
+| `coord.thomas` | Care Coordinator | All records, operational answers; **Triage queue** and case board |
 | `ananya.rao` / `rahul.mehta` | Patient | Own lab record only, simplified answers |
 | `riya.das` | Patient | Own record (sulfa allergy) |
 

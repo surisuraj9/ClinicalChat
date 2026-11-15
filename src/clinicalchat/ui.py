@@ -18,10 +18,11 @@ from clinicalchat.orchestrator import ChatSession, Event, Orchestrator
 from clinicalchat.personas import PERSONAS, Persona, get_persona
 from clinicalchat.extraction import MAX_UPLOAD_FILES, SUPPORTED_UPLOADS
 from clinicalchat.rbac import AGENT_LABELS, AGENT_ORDER, AgentName, Role, policy
+from clinicalchat import workflow as wf
 from clinicalchat.store import get_store
 
 LOGO_URL = "/brand/logo.svg"
-N_CHIPS = 4
+N_CHIPS = 5
 POLL_SECONDS = 10
 
 EXAMPLES: Dict[Role, List[str]] = {
@@ -30,6 +31,7 @@ EXAMPLES: Dict[Role, List[str]] = {
         "Explain my latest report in simple terms",
         "Is it safe for me to take ibuprofen?",
         "What is HbA1c?",
+        "What is the status of my case?",
     ],
     Role.CLINICIAN: [
         "Interpret this patient's lab results.",
@@ -48,6 +50,7 @@ EXAMPLES: Dict[Role, List[str]] = {
         "What follow-up tests are recommended based on these results?",
         "Which specialists should be involved in this patient's care?",
         "Check for drug allergies before prescribing ibuprofen.",
+        "Where is this patient's case now?",
     ],
 }
 DEFAULT_PATIENT = {Role.CLINICIAN: "ananya-rao-54", Role.RADIOLOGIST: "meera-nair-47", Role.COORDINATOR: "john-doe-54"}
@@ -118,6 +121,16 @@ button.cc-chip:hover {background:#eef2ff !important; border-color:#c7d2fe !impor
 .cc-case .top {display:flex; justify-content:space-between; gap:8px;}
 .cc-case .sub {color:#6b7280; font-size:11.5px; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
 .cc-case:last-child {border-bottom:none;}
+.cc-steps {display:flex; flex-wrap:wrap; gap:4px; margin-top:5px;}
+.cc-steps span {font-size:11px; padding:1px 7px; border-radius:999px; border:1px solid #e5e7eb; color:#9ca3af; background:#fff;}
+.cc-steps span.done {color:#166534; border-color:#bbf7d0; background:#f0fdf4;}
+.cc-steps span.now {color:#fff; border-color:#4f46e5; background:#4f46e5; font-weight:600;}
+.cc-steps span.skip {text-decoration:line-through;}
+.cc-board {display:grid; grid-template-columns:repeat(2, 1fr); gap:6px; margin-top:6px;}
+.cc-bcell {border:1px solid #e5e7eb; border-radius:10px; padding:6px 8px; background:#f9fafb; display:flex; flex-direction:column;}
+.cc-bcell b {font-size:18px; color:#111827; line-height:1.1;}
+.cc-bcell span {font-size:11px; color:#6b7280;}
+.cc-qrow {gap:8px !important; flex-wrap:nowrap !important;}
 .cc-case .st {white-space:nowrap; font-weight:600;}
 .cc-badge {display:inline-block; min-width:20px; padding:0 7px; border-radius:999px; background:#4f46e5; color:#fff; font-size:11px;
   font-weight:700; text-align:center; margin-left:6px; text-transform:none; letter-spacing:0;}
@@ -237,44 +250,102 @@ def patient_card(session: Optional[ChatSession]) -> str:
             f"<div>{tags}</div>{allergy}{extra_html}")
 
 
-CASE_STATUS = {"PENDING_REVIEW": ("⏳ Awaiting clinician", "#b45309"), "VALIDATED": ("✅ Reviewed", "#166534"),
-               "RETURNED": ("↩️ More info needed", "#991b1b")}
 RISK_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🟢"}
+STEP_ICON = {"done": "✓", "now": "●", "todo": "○", "skip": "–"}
+
+
+def case_stage_label(case: dict) -> tuple:
+    label, color = wf.STAGE_LABEL.get(case["status"], (case["status"], "#6b7280"))
+    name = wf.assigned_clinician(case) and (case["payload"].get("triage") or {}).get("clinician_name")
+    if case["status"] == wf.CLINICIAN and name:
+        label = f"⏳ With {name}"
+    return label, color
+
+
+def _stepper_html(case: dict) -> str:
+    return "<div class='cc-steps'>" + "".join(
+        f"<span class='{st}'>{STEP_ICON[st]} {html.escape(s)}</span>" for s, st in wf.stepper(case)) + "</div>"
 
 
 def my_cases_html(session: Optional[ChatSession]) -> str:
     if session is None or not session.own_patient:
         return ""
-    cases = [c for c in get_store().cases(patient_key=session.own_patient) if c["status"] in CASE_STATUS]
+    cases = [c for c in get_store().cases(patient_key=session.own_patient) if c["status"] in wf.STAGE_LABEL]
     cases.sort(key=lambda c: c["created"], reverse=True)
-    cases.sort(key=lambda c: c["status"] not in ("PENDING_REVIEW", "RETURNED"))  # open case first, then newest
+    cases.sort(key=lambda c: c["status"] not in wf.OPEN_STATUSES)  # open case first, then newest
     cases = cases[:4]
     if not cases:
-        return "<div class='cc-muted'>No case yet. After you describe symptoms or attach reports, the AI assessment opens one case for you; a clinician then confirms it.</div>"
+        return ("<div class='cc-muted'>No case yet. After you describe symptoms or attach reports, the AI assessment opens "
+                "one case; the care team (radiologist for scans → care coordinator → clinician) then takes it forward.</div>")
     rows = []
     for c in cases:
-        label, color = CASE_STATUS[c["status"]]
+        label, color = case_stage_label(c)
         n = len(c["payload"].get("history") or [None])
         tip = html.escape(" | ".join(h["question"] for h in c["payload"].get("history", [])) or c["question"])
         last = (c["payload"].get("history") or [{"question": c["question"]}])[-1]["question"] or "report upload"
         sub = f"{n} message{'s' if n > 1 else ''} · last: {html.escape(last)}"
+        steps = _stepper_html(c) if c["status"] in wf.OPEN_STATUSES else ""
         rows.append(f"<div class='cc-case' title='{tip}'><div class='top'><b>{c['case_id']}</b>"
-                    f"<span class='st' style='color:{color}'>{label}</span></div><div class='sub'>{sub}</div></div>")
+                    f"<span class='st' style='color:{color}'>{html.escape(label)}</span></div>{steps}<div class='sub'>{sub}</div></div>")
     return "".join(rows)
 
 
-def review_choices() -> List[tuple]:
+QUEUE_TITLE = {Role.CLINICIAN: "Review queue", Role.RADIOLOGIST: "Imaging queue", Role.COORDINATOR: "Triage queue"}
+QUEUE_EMPTY = {Role.CLINICIAN: "✓ No cases assigned to you", Role.RADIOLOGIST: "✓ No scans waiting",
+               Role.COORDINATOR: "✓ Nothing to triage"}
+QUEUE_PICK = {Role.CLINICIAN: "— Select a case to review —", Role.RADIOLOGIST: "— Select a case to read —",
+              Role.COORDINATOR: "— Select a case to triage —"}
+PRIORITY_RANK = {p: i for i, p in enumerate(wf.PRIORITIES)}
+
+
+def has_queue(role: Optional[Role]) -> bool:
+    return role in wf.QUEUE_FOR_ROLE
+
+
+def queue_cases(session: Optional[ChatSession]) -> List[dict]:
+    if session is None or not has_queue(session.role):
+        return []
+    cases = get_store().cases(status=wf.QUEUE_FOR_ROLE[session.role])
+    if session.role == Role.CLINICIAN:  # only cases assigned to me (or legacy un-triaged ones)
+        cases = [c for c in cases if wf.assigned_clinician(c) in (None, session.username)]
+        cases.sort(key=lambda c: PRIORITY_RANK.get((c["payload"].get("triage") or {}).get("priority"), 1))
+    return cases
+
+
+def review_choices(session: Optional[ChatSession] = None) -> List[tuple]:
     engine = get_engine()
     out = []
-    for c in get_store().cases(status="PENDING_REVIEW"):
+    for c in queue_cases(session):
         p = engine.patient(c["patient_key"])
-        out.append((f"{RISK_ICON.get(c['risk_level'], '')} {p.name if p else c['patient_key']} · {c['question'][:34]}", c["case_id"]))
-    placeholder = "— Select a case to review —" if out else "✓ No cases waiting"
+        pri = (c["payload"].get("triage") or {}).get("priority")
+        tag = f"{pri} · " if pri else ""
+        out.append((f"{RISK_ICON.get(c['risk_level'], '')} {tag}{p.name if p else c['patient_key']} · {c['question'][:30]}",
+                    c["case_id"]))
+    role = session.role if session else Role.CLINICIAN
+    placeholder = QUEUE_PICK.get(role, "— Select a case —") if out else QUEUE_EMPTY.get(role, "✓ Nothing waiting")
     return [(placeholder, "")] + out
 
 
-def review_title(n: int) -> str:
-    return f"<div class='cc-h'>Review queue<span class='cc-badge'>{n}</span></div>"
+NOTE_PLACEHOLDER = {Role.CLINICIAN: "Note to patient / feedback for the agents (optional)",
+                    Role.RADIOLOGIST: "Your read: findings / impression (required unless you agree with the AI)",
+                    Role.COORDINATOR: "Hand-off note for the clinician (optional)"}
+ACTION_LABEL = {Role.CLINICIAN: "✅ Approve & send", Role.RADIOLOGIST: "🩻 Submit read", Role.COORDINATOR: "🧭 Route to clinician"}
+
+
+def review_title(n: int, role: Optional[Role] = Role.CLINICIAN) -> str:
+    return f"<div class='cc-h'>{QUEUE_TITLE.get(role, 'Queue')}<span class='cc-badge'>{n}</span></div>"
+
+
+def board_html() -> str:
+    """Care coordinator's overview of every open case by stage."""
+    counts = {s: 0 for s in wf.OPEN_STATUSES}
+    urgent = 0
+    for c in get_store().cases():
+        if c["status"] in counts:
+            counts[c["status"]] += 1
+            urgent += c["risk_level"] in ("HIGH", "CRITICAL")
+    cells = "".join(f"<div class='cc-bcell'><b>{counts[s]}</b><span>{wf.STAGE_LABEL[s][0]}</span></div>" for s in wf.OPEN_STATUSES)
+    return f"<div class='cc-board'>{cells}</div><div class='cc-muted' style='margin-top:4px'>⚠️ {urgent} open case(s) at high / critical risk</div>"
 
 
 def _case_questions(case: dict) -> str:
@@ -285,27 +356,101 @@ def _case_questions(case: dict) -> str:
                                                              enumerate(hist, 1)) + "\n\n")
 
 
-def case_markdown(case: dict) -> str:
-    engine = get_engine()
-    p = engine.patient(case["patient_key"])
+def _case_head(case: dict) -> str:
+    p = get_engine().patient(case["patient_key"])
+    label, _ = case_stage_label(case)
+    return (f"### 🩺 Case {case['case_id']} — {p.label if p else case['patient_key']}\n"
+            f"**Stage:** {label} · **Risk:** {RISK_ICON.get(case['risk_level'], '')} {case['risk_level']}"
+            + (" · escalated" if case["escalate"] else "") + "\n\n" + _case_questions(case))
+
+
+def _radiology_md(pay: dict) -> str:
+    reads = (pay.get("radiology") or {}).get("reads") or []
+    return "".join(f"\n\n**🩻 Radiology read — {r['reader']}** ({r['at']}): _{r['verdict']}_"
+                   + (f"\n> {r['report']}" if r.get("report") else "") for r in reads)
+
+
+def _triage_md(pay: dict) -> str:
+    tri = pay.get("triage")
+    if not tri:
+        return ""
+    return (f"\n\n**🧭 Triage — {tri['coordinator']}** ({tri['at']}): {wf.PRIORITY_ICON[tri['priority']]} **{tri['priority']}**, "
+            f"assigned to **{tri['clinician_name']}**" + (f"\n> {tri['note']}" if tri.get("note") else ""))
+
+
+def _timeline_md(pay: dict) -> str:
+    events = pay.get("timeline") or []
+    if not events:
+        return ""
+    return ("\n\n<details><summary>Case timeline</summary>\n\n"
+            + "\n".join(f"- {e['at']} · **{e['actor']}** — {e['event']}" for e in events[-12:]) + "\n\n</details>")
+
+
+def radiology_case_markdown(case: dict) -> str:
+    """Radiologist view: imaging + allergies / contrast only (RBAC: no lab results, no full AI insight)."""
+    pay = case["payload"]
+    md = _case_head(case)
+    for i, im in enumerate(pay.get("imaging") or [], 1):
+        md += f"\n**🩻 Imaging {i}: {im['title']}**" + (f" · {im['date']}" if im.get("date") else "") + f" · _{im['source']}_"
+        if im.get("impression"):
+            md += f"\n- Impression (extracted): {im['impression']}"
+        if im.get("red_flags"):
+            md += "\n- 🚩 Red flags: " + ", ".join(im["red_flags"])
+        if im.get("abnormal"):
+            md += "\n- Abnormal: " + ", ".join(im["abnormal"])
+        md += f"\n\n<details><summary>Report text</summary>\n\n```\n{im['text']}\n```\n</details>\n"
+    allergies = pay.get("allergies") or []
+    md += "\n**⚠️ Allergies:** " + (", ".join(allergies) if allergies else "none recorded")
+    alerts = pay.get("contrast_alerts") or []
+    md += "\n\n**💉 Iodinated contrast check:** " + ("\n" + "\n".join(f"- {a}" for a in alerts) if alerts else "no allergy / interaction alert")
+    md += _radiology_md(pay) + _timeline_md(pay)
+    md += "\n\n_Choose a verdict, write your read on the left and press **🩻 Submit read** — it goes to the care coordinator._"
+    return md
+
+
+def coordinator_case_markdown(case: dict) -> str:
     pay = case["payload"]
     ins = pay.get("insight", {})
-    md = (f"### 🩺 Case {case['case_id']} — {p.label if p else case['patient_key']}\n"
-          + _case_questions(case) + f"**Risk:** {RISK_ICON.get(case['risk_level'], '')} {case['risk_level']}"
-          + (" · escalated" if case["escalate"] else ""))
+    md = _case_head(case)
+    flags = [i for i in (pay.get("risk") or {}).get("indicators", []) if i.get("level") in ("HIGH", "CRITICAL")]
+    if flags:
+        md += "\n**🚨 Risk flags:**\n" + "\n".join(f"- {RISK_ICON.get(f['level'], '')} {f['indicator']}" for f in flags[:6])
+    if pay.get("report_types"):
+        md += "\n\n**📄 Reports in this case:** " + ", ".join(pay["report_types"])
+    if pay.get("possible_conditions"):
+        md += "\n\n**AI-suggested possibilities:** " + ", ".join(map(str, pay["possible_conditions"][:5]))
+    if ins.get("next_steps"):
+        md += "\n\n**Suggested next steps:** " + "; ".join(map(str, ins["next_steps"][:5]))
+    md += _radiology_md(pay) + _timeline_md(pay)
+    md += (f"\n\n**Suggested priority:** {wf.PRIORITY_ICON[wf.suggested_priority(case['risk_level'])]} "
+           f"{wf.suggested_priority(case['risk_level'])} (from risk {case['risk_level']})"
+           "\n\n_Set the priority, pick a clinician on the left and press **🧭 Route to clinician**._")
+    return md
+
+
+def case_markdown(case: dict) -> str:
+    """Clinician view: full findings, AI insight, radiology read, triage and the text shown to the patient."""
+    pay = case["payload"]
+    ins = pay.get("insight", {})
+    md = _case_head(case)
     if pay.get("review_reasons"):
-        md += "\n\n> 🟠 **Review Required** — " + "; ".join(pay["review_reasons"])
+        md += "\n> 🟠 **Review Required** — " + "; ".join(pay["review_reasons"])
     if pay.get("facts"):
         md += "\n\n**🔬 Deterministic findings**\n```\n" + pay["facts"][:1500] + "\n```"
     if ins.get("answer"):
         md += f"\n\n**💡 Clinical insight** (confidence {ins.get('confidence', 0):.0%})\n{ins['answer']}"
         if ins.get("next_steps"):
             md += "\n\n**Next steps:** " + "; ".join(map(str, ins["next_steps"]))
+    md += _radiology_md(pay) + _triage_md(pay)
     md += "\n\n---\n**💬 Shown to the patient as an AI assessment (latest):**\n\n" + "\n".join("> " + line for line in case["patient_draft"].splitlines())
     if pay.get("guard_issues"):
         md += "\n\n**🛡️ Guard flags:** " + "; ".join(pay["guard_issues"])
+    md += _timeline_md(pay)
     md += "\n\n_Add an optional note on the left, then **Approve & send** or **Return**._"
     return md
+
+
+CASE_VIEW = {Role.CLINICIAN: case_markdown, Role.RADIOLOGIST: radiology_case_markdown, Role.COORDINATOR: coordinator_case_markdown}
 
 
 STATE_TEXT = {"idle": "Ready", "locked": "🔒 Not for your role", "queued": "Queued…", "skipped": "Not needed",
@@ -322,7 +467,7 @@ def agent_strip(role: Optional[Role], states: Optional[Dict[str, tuple]] = None)
     for a in AGENT_ORDER:
         state, note = states.get(a.value, ("idle" if a in allowed else "locked", ""))
         if role == Role.PATIENT and a == AgentName.INSIGHT and state == "idle":
-            note = "for your clinician"
+            note = "for the care team"
         text = STATE_TEXT[state] + (f" · {note}" if note else "")
         tiles.append(f"<div class='cc-agent {state}' title='{html.escape(AGENT_LABELS[a] + ' — ' + text)}'>"
                      f"<div class='ak'>{AGENT_KIND[a]}</div><div class='an'>{AGENT_LABELS[a]}</div>"
@@ -345,10 +490,18 @@ def welcome(persona: Persona) -> List[dict]:
                 "away if you need urgent care, **💡 Insight Generation** prepares a summary for your clinician and "
                 "**💬 Patient Communication** explains it in plain language right away, with your **case ID** — a clinician then confirms or corrects it.")
     elif persona.role == Role.CLINICIAN:
-        body = ("Pick a patient on the left (or name one in your question). Each question runs the 5-agent pipeline; "
-                "patient cases waiting for your validation are in the **Review queue**.")
+        body = ("Pick a patient on the left (or name one in your question). Each question runs the 5-agent pipeline. "
+                "Patient cases **assigned to you by the care coordinator** (with the radiologist's read, when there are "
+                "scans) are in your **Review queue** — confirm them or ask the patient for more information.")
+    elif persona.role == Role.RADIOLOGIST:
+        body = ("Patient cases with **scans** come to your **Imaging queue** first. Open one, read the imaging (with the "
+                "allergy / contrast check), choose a verdict and **Submit read** — the case then goes to the care "
+                "coordinator. You can also pick a patient and ask imaging questions here (lab results are not shown "
+                "for your role).")
     else:
-        body = "Pick a patient on the left (or name one in your question) and ask away — the agent strip shows who is working."
+        body = ("Every patient case comes to your **Triage queue** (after the radiologist, when there are scans). Open "
+                "one, set the **priority** and **assign a clinician** — the board shows where all open cases are. You "
+                "can also pick a patient and ask for a hand-off summary here.")
     return [{"role": "assistant", "content": f"{greet}\n\n{body}"}]
 
 
@@ -415,7 +568,7 @@ def _stream(events: Iterator[Event], user_text: str, history: List[dict], sessio
                         failed = "failed" in ev.title
                         note = "" if short in ("done", "") else short
                         if agent == AgentName.INSIGHT.value and role == Role.PATIENT and not failed:
-                            note = "sent to clinician"
+                            note = "for the care team"
                         states[agent] = ("failed" if failed else "done", note)
             elif ev.kind == "step":
                 findings[ev.title] = f"**{ev.title}**\n{ev.text}"
@@ -585,13 +738,24 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
                     card = gr.HTML(padding=False)
                 with gr.Column(elem_classes="cc-tile", visible=False) as review_tile:
                     rev_title = gr.HTML(review_title(0), padding=False)
+                    board = gr.HTML(padding=False, visible=False)
                     review_pick = gr.Dropdown(show_label=False, choices=[], value=None, interactive=True, container=False,
-                                              filterable=False)
+                                              filterable=False, elem_id="cc-queue")
+                    verdict_pick = gr.Dropdown(list(wf.RADIOLOGY_VERDICTS), value=wf.RADIOLOGY_VERDICTS[0], show_label=False,
+                                               container=False, interactive=True, visible=False, filterable=False,
+                                               elem_id="cc-verdict")
+                    with gr.Row(elem_classes="cc-qrow", visible=False) as triage_row:
+                        priority_pick = gr.Dropdown([(f"{wf.PRIORITY_ICON[x]} {x}", x) for x in wf.PRIORITIES], value="Soon",
+                                                    show_label=False, container=False, interactive=True, filterable=False,
+                                                    min_width=100, elem_id="cc-priority")
+                        assign_pick = gr.Dropdown([(p.display_name, p.username) for p in PERSONAS.values() if p.role == Role.CLINICIAN],
+                                                  value="dr.sharma", show_label=False, container=False, interactive=True,
+                                                  filterable=False, min_width=140, elem_id="cc-assign")
                     review_note = gr.Textbox(show_label=False, placeholder="Note to patient / feedback for the agents (optional)",
-                                             lines=2, max_lines=3, container=False)
+                                             lines=2, max_lines=3, container=False, elem_id="cc-note")
                     with gr.Row(elem_classes="cc-rev-btns"):
-                        approve_btn = gr.Button("✅ Approve & send", variant="primary", size="sm")
-                        return_btn = gr.Button("↩️ Return", size="sm", elem_classes="cc-sec")
+                        approve_btn = gr.Button("✅ Approve & send", variant="primary", size="sm", elem_id="cc-act")
+                        return_btn = gr.Button("↩️ Return", size="sm", elem_classes="cc-sec", elem_id="cc-return")
                 with gr.Column(elem_classes="cc-tile", visible=False) as cases_tile:
                     gr.HTML("<div class='cc-h'>My case updates</div>", padding=False)
                     cases_box = gr.HTML(padding=False)
@@ -636,14 +800,21 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
             chip_updates = [gr.update(value=ex[i], visible=True) if i < len(ex) else gr.update(visible=False) for i in range(N_CHIPS)]
             history = welcome(persona)
             history = deliver_updates(s, history) or history
-            pending = review_choices() if pol.can_review else [("", "")]
+            queue = has_queue(persona.role)
+            pending = review_choices(s) if queue else [("", "")]
+            role = persona.role
             return [s, user_html(persona), title, pick, patient_card(s), agent_strip(persona.role), history,
                     gr.update(value=None, interactive=False), gr.update(visible=pol.can_upload),
-                    gr.update(visible=pol.can_review), review_title(len(pending) - 1), gr.update(choices=pending, value=""),
-                    gr.update(visible=persona.role == Role.PATIENT), my_cases_html(s), *chip_updates]
+                    gr.update(visible=queue), review_title(len(pending) - 1, role), gr.update(choices=pending, value=""),
+                    gr.update(visible=persona.role == Role.PATIENT), my_cases_html(s), *chip_updates,
+                    gr.update(visible=role == Role.COORDINATOR, value=board_html() if role == Role.COORDINATOR else ""),
+                    gr.update(visible=role == Role.RADIOLOGIST), gr.update(visible=role == Role.COORDINATOR),
+                    gr.update(placeholder=NOTE_PLACEHOLDER.get(role, ""), value=""),
+                    gr.update(value=ACTION_LABEL.get(role, "Submit")), gr.update(visible=role == Role.CLINICIAN)]
 
         load_outputs = [session, user_box, patient_title, patient_pick, card, strip, chatbot, export_btn, upload_btn,
-                        review_tile, rev_title, review_pick, cases_tile, cases_box, *chips]
+                        review_tile, rev_title, review_pick, cases_tile, cases_box, *chips,
+                        board, verdict_pick, triage_row, review_note, approve_btn, return_btn]
 
         def on_load(request: gr.Request):
             username = getattr(request, "username", None) if auth_enabled else "dr.sharma"
@@ -670,9 +841,9 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
             if s.role != Role.PATIENT and s.last_patient and s.last_patient != s.selected_patient:
                 s.selected_patient = s.last_patient
                 pick = gr.update(value=s.last_patient)
-            if policy(s.role).can_review:
-                pending = review_choices()
-                rev = (review_title(len(pending) - 1), gr.update(choices=pending))
+            if has_queue(s.role):
+                pending = review_choices(s)
+                rev = (review_title(len(pending) - 1, s.role), gr.update(choices=pending))
             else:
                 rev = (gr.update(), gr.update())
             return export, pick, patient_card(s), my_cases_html(s), *rev
@@ -689,57 +860,87 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
         attach_chip.change(update_attachments, [attach_chip, attached], [attached, attach_chip, msg],
                            show_progress="hidden")
 
-        # ---------------- clinician review queue
+        # ---------------- care-team work queues (radiologist → coordinator → clinician)
         def open_case(case_id: Optional[str], history: List[dict], s: Optional[ChatSession]):
-            nothing = (gr.update(), gr.update(), gr.update())
-            if not case_id or s is None or not policy(s.role).can_review:
+            nothing = (gr.update(),) * 5
+            if not case_id or s is None or not has_queue(s.role):
                 return nothing
             case = get_store().case(case_id)
-            if not case:
+            if not case or case["status"] != wf.QUEUE_FOR_ROLE[s.role]:
                 return nothing
             s.selected_patient = case["patient_key"]
             pick = gr.update(choices=staff_patient_choices(), value=case["patient_key"])
-            return list(history or []) + [{"role": "assistant", "content": case_markdown(case)}], pick, patient_card(s)
+            view = CASE_VIEW[s.role](case)
+            priority = gr.update(value=wf.suggested_priority(case["risk_level"])) if s.role == Role.COORDINATOR else gr.update()
+            verdict = gr.update(value=wf.RADIOLOGY_VERDICTS[0]) if s.role == Role.RADIOLOGIST else gr.update()
+            return list(history or []) + [{"role": "assistant", "content": view}], pick, patient_card(s), priority, verdict
 
-        review_pick.change(open_case, [review_pick, chatbot, session], [chatbot, patient_pick, card])
+        review_pick.change(open_case, [review_pick, chatbot, session], [chatbot, patient_pick, card, priority_pick, verdict_pick])
 
         def decide(approve: bool):
-            def _do(case_id: Optional[str], note: str, history: List[dict], s: Optional[ChatSession]):
+            def _do(case_id: Optional[str], note: str, verdict: str, priority: str, assignee: str, history: List[dict],
+                    s: Optional[ChatSession]):
                 history = list(history or [])
-                if s is None or not policy(s.role).can_review:
-                    return history, gr.update(), gr.update(), gr.update()
+                keep = (gr.update(),) * 4
+                if s is None or not has_queue(s.role):
+                    return history, *keep
                 if not case_id:
-                    history.append({"role": "assistant", "content": "Select a case from the **Review queue** first."})
-                    return history, gr.update(), gr.update(), gr.update()
-                case = get_orchestrator().review(case_id, s.display_name, approve, note)
-                p = get_engine().patient(case["patient_key"])
-                verb = "approved and sent to" if approve else "returned to"
-                history.append({"role": "assistant", "content":
-                                f"{'✅' if approve else '↩️'} Case **{case_id}** {verb} **{p.name if p else case['patient_key']}**."
-                                + (f"\n\n_Your note will also help the Insight agent on future cases:_ “{note.strip()}”" if note.strip() else "")})
-                pending = review_choices()
-                return history, review_title(len(pending) - 1), gr.update(choices=pending, value=""), ""
+                    history.append({"role": "assistant", "content": f"Select a case from the **{QUEUE_TITLE[s.role]}** first."})
+                    return history, *keep
+                orch, note = get_orchestrator(), (note or "").strip()
+                try:
+                    if s.role == Role.RADIOLOGIST:
+                        if verdict != wf.RADIOLOGY_VERDICTS[0] and not note:
+                            history.append({"role": "assistant", "content": "Please write your findings / impression in the "
+                                            "box before submitting a **different** or **critical** read."})
+                            return history, *keep
+                        case = orch.radiology_read(case_id, s.display_name, verdict, note)
+                        nxt = case_stage_label(case)[0]
+                        msg = f"🩻 Read submitted for case **{case_id}** — _{verdict}_. Next: **{nxt}**."
+                    elif s.role == Role.COORDINATOR:
+                        case = orch.triage(case_id, s.display_name, priority, assignee, note)
+                        tri = case["payload"]["triage"]
+                        msg = (f"🧭 Case **{case_id}** triaged {wf.PRIORITY_ICON[priority]} **{priority}** and assigned to "
+                               f"**{tri['clinician_name']}**.")
+                    else:
+                        case = orch.review(case_id, s.display_name, approve, note)
+                        p = get_engine().patient(case["patient_key"])
+                        verb = "approved and sent to" if approve else "returned to"
+                        msg = (f"{'✅' if approve else '↩️'} Case **{case_id}** {verb} **{p.name if p else case['patient_key']}**."
+                               + (f"\n\n_Your note will also help the Insight agent on future cases:_ “{note}”" if note else ""))
+                except ValueError as exc:
+                    msg = f"⚠️ {exc} — it may have been handled already. The queue has been refreshed."
+                history.append({"role": "assistant", "content": msg})
+                pending = review_choices(s)
+                board_up = gr.update(value=board_html()) if s.role == Role.COORDINATOR else gr.update()
+                return history, review_title(len(pending) - 1, s.role), gr.update(choices=pending, value=""), "", board_up
             return _do
 
-        rev_outputs = [chatbot, rev_title, review_pick, review_note]
-        approve_btn.click(decide(True), [review_pick, review_note, chatbot, session], rev_outputs)
-        return_btn.click(decide(False), [review_pick, review_note, chatbot, session], rev_outputs)
+        rev_inputs = [review_pick, review_note, verdict_pick, priority_pick, assign_pick, chatbot, session]
+        rev_outputs = [chatbot, rev_title, review_pick, review_note, board]
+        approve_btn.click(decide(True), rev_inputs, rev_outputs)
+        return_btn.click(decide(False), rev_inputs, rev_outputs)
 
         # ---------------- polling: patients receive reviewed answers, clinicians see new cases
         def poll(s: Optional[ChatSession], history: List[dict]):
+            none = (gr.update(),) * 5
             if s is None:
-                return gr.update(), gr.update(), gr.update(), gr.update()
+                return none
             if s.role == Role.PATIENT:
                 updated = deliver_updates(s, history)
-                if updated is None:
-                    return gr.update(), gr.update(), gr.update(), gr.update()
-                return updated, my_cases_html(s), gr.update(), gr.update()
-            if policy(s.role).can_review:
-                pending = review_choices()
-                return gr.update(), gr.update(), review_title(len(pending) - 1), gr.update(choices=pending)
-            return gr.update(), gr.update(), gr.update(), gr.update()
+                cases_html = my_cases_html(s)
+                changed = cases_html != getattr(s, "ui_cases_html", None)
+                s.ui_cases_html = cases_html
+                if updated is None and not changed:
+                    return none
+                return (updated if updated is not None else gr.update(), cases_html, gr.update(), gr.update(), gr.update())
+            if has_queue(s.role):
+                pending = review_choices(s)
+                board_up = gr.update(value=board_html()) if s.role == Role.COORDINATOR else gr.update()
+                return gr.update(), gr.update(), review_title(len(pending) - 1, s.role), gr.update(choices=pending), board_up
+            return none
 
-        timer.tick(poll, [session, chatbot], [chatbot, cases_box, rev_title, review_pick], show_progress="hidden")
+        timer.tick(poll, [session, chatbot], [chatbot, cases_box, rev_title, review_pick, board], show_progress="hidden")
 
         def do_clear(s: Optional[ChatSession]):
             if s is not None:

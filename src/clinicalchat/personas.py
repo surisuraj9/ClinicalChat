@@ -23,6 +23,7 @@ class Persona:
 
 PERSONAS: Dict[str, Persona] = {p.username: p for p in [
     Persona("dr.sharma", "Dr. Neha Sharma", Role.CLINICIAN, "Consultant Physician"),
+    Persona("dr.menon", "Dr. Kavya Menon", Role.CLINICIAN, "General Physician"),
     Persona("dr.iyer", "Dr. Arjun Iyer", Role.RADIOLOGIST, "Consultant Radiologist"),
     Persona("coord.thomas", "Maria Thomas", Role.COORDINATOR, "Care Coordinator"),
     Persona("ananya.rao", "Ananya Rao", Role.PATIENT, "Patient", "ananya-rao-54"),

@@ -76,6 +76,7 @@ ALLERGENS = {
     "ibuprofen": ("Medication", ["nsaid", "nsaids"]),
     "paracetamol": ("Medication", ["acetaminophen"]),
     "penicillin": ("Medication", ["amoxicillin", "penicillins"]),
+    "iodinated contrast": ("Medication", ["iodine", "contrast dye", "contrast media", "contrast agent", "iv contrast", "ct contrast", "radiocontrast", "x-ray dye"]),
 }
 
 # (allergen a, allergen b, risk, mechanism)
@@ -123,6 +124,8 @@ ALLERGEN_DRUG_RULES = {
 
 # allergen -> safer alternatives (drug or advice)
 ALLERGEN_ALTERNATIVES = {
+    "iodinated contrast": ["non-contrast CT or MRI if it answers the question", "premedication protocol per local policy "
+                           "if contrast is essential"],
     "ibuprofen": ["paracetamol", "celecoxib (under supervision)"],
     "paracetamol": ["ibuprofen (if no NSAID intolerance)", "non-drug measures"],
     "sulfamethoxazole": ["amoxicillin (if no penicillin allergy)", "azithromycin"],

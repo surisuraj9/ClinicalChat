@@ -1,10 +1,13 @@
 """Orchestrator — the 5-agent pipeline from the course slide:
 
   📄 Data Extraction → 🔬 Clinical Analysis → 🚨 Risk Detection → 💡 Insight Generation → 💬 Patient Communication
-     (deterministic)      (deterministic:        (deterministic       (LLM, 1 call)           (LLM, 1 call, patients;
-                           Lab Interpreter,       rules)                                        held for clinician review)
+     (deterministic)      (deterministic:        (deterministic       (LLM, 1 call)           (LLM, 1 call, patients)
+                           Lab Interpreter,       rules)
                            Radiology Analyzer,
                            Allergy Safety)
+
+Patient answers are shown at once as an AI assessment; the case then moves through the care team (workflow.py):
+🩻 radiologist (only when there is imaging) → 🧭 care coordinator (priority, assignment) → 👩‍⚕️ clinician (confirms).
 
 `ask()` / `upload()` are generators of `Event`s so the UI can show live progress. Deterministic safety information
 (drug/allergy conflicts, emergency guidance) is shown immediately and is never held back.
@@ -34,6 +37,7 @@ from clinicalchat.models import Domain
 from clinicalchat.rbac import AGENT_LABELS, AgentName, Role, policy
 from clinicalchat.risk import PATIENT_GUIDANCE, RiskAssessment, RiskDetectionAgent
 from clinicalchat.router import RoutePlan, Router
+from clinicalchat import workflow as wf
 from clinicalchat.store import Store, get_store
 
 HISTORY_TURNS = 3
@@ -129,7 +133,11 @@ class Orchestrator:
             yield Event("blocked", "🔒 Access", plan.blocked)
             return self._finish(session, turn, plan, run, started)
 
-        if plan.mode == "general":
+        if plan.mode == "status":
+            md = self.case_status_markdown(plan.patient_key)
+            turn.answers.append({"label": "📁 Case status", "markdown": md, "summary": md[:300]})
+            yield Event("answer", "📁 Your case — where it is now", md, data={"agent": "status"})
+        elif plan.mode == "general":
             yield from self._general(question, session, plan, turn, run)
         elif plan.mode == "explain" and has_insight:
             yield from self._explain_last(question, session, turn, run)
@@ -257,6 +265,8 @@ class Orchestrator:
         case = self.store.case(case_id)
         if not case:
             raise ValueError(f"Unknown case {case_id}")
+        if case["status"] != wf.CLINICIAN:
+            raise ValueError(f"Case {case_id} is not waiting for a clinician")
         status = "VALIDATED" if approve else "RETURNED"
         final = (edited_message.strip() or case["patient_draft"]) if approve else ""
         if approve and note.strip():
@@ -267,6 +277,73 @@ class Orchestrator:
         self.auditor.record({"event": "review", "case": case_id, "reviewer": reviewer, "status": status,
                              "note": note.strip(), "edited": bool(edited_message.strip())})
         return self.store.case(case_id)
+
+    def radiology_read(self, case_id: str, reader: str, verdict: str, report: str) -> Dict[str, Any]:
+        """🩻 Radiologist's read of the case's imaging; the case then goes to the care coordinator (or straight back to
+        the assigned clinician if it was triaged already and nothing critical was found)."""
+        case = self.store.case(case_id)
+        if not case:
+            raise ValueError(f"Unknown case {case_id}")
+        if verdict not in wf.RADIOLOGY_VERDICTS:
+            raise ValueError(f"Unknown verdict {verdict}")
+        doc_ids = [i["doc_id"] for i in case["payload"].get("imaging", []) if i.get("doc_id")]
+        case = self.store.radiology_read(case_id, reader=reader, verdict=verdict, report=report.strip(), doc_ids=doc_ids)
+        self.auditor.record({"event": "radiology_read", "case": case_id, "reader": reader, "verdict": verdict,
+                             "next": case["status"]})
+        return case
+
+    def triage(self, case_id: str, coordinator: str, priority: str, clinician: str, note: str = "") -> Dict[str, Any]:
+        """🧭 Care coordinator sets the priority and assigns the clinician who will confirm the case."""
+        from clinicalchat.personas import PERSONAS
+
+        doc = PERSONAS.get(clinician)
+        if not doc or doc.role != Role.CLINICIAN:
+            raise ValueError(f"{clinician} is not a clinician")
+        case = self.store.triage(case_id, coordinator=coordinator, priority=priority, clinician=doc.username,
+                                 clinician_name=doc.display_name, note=note.strip())
+        self.auditor.record({"event": "triage", "case": case_id, "coordinator": coordinator, "priority": priority,
+                             "clinician": doc.username})
+        return case
+
+    def case_status_markdown(self, patient_key: Optional[str]) -> str:
+        """Deterministic answer to 'what is happening with my case?' (no LLM call)."""
+        cases = [c for c in self.store.cases(patient_key=patient_key) if c["status"] != wf.MERGED] if patient_key else []
+        if not cases:
+            return ("You don't have a case yet. Describe how you feel or attach your reports with **📎 Attach** — the AI "
+                    "assessment opens a case for you and the care team takes it from there.")
+        open_ = [c for c in cases if c["status"] in wf.OPEN_STATUSES]
+        case = open_[0] if open_ else max(cases, key=lambda c: c["reviewed"] or c["created"])
+        pay = case["payload"]
+        tri = pay.get("triage") or {}
+        label = wf.STAGE_LABEL.get(case["status"], (case["status"], ""))[0]
+        if case["status"] == wf.CLINICIAN and tri.get("clinician_name"):
+            label = f"⏳ With {tri['clinician_name']}"
+        md = f"**Case {case['case_id']}** — {label}\n\n"
+        md += " → ".join({"done": f"✅ {s}", "now": f"**▶ {s}**", "todo": f"◻️ {s}", "skip": f"~~{s}~~"}[st]
+                         for s, st in wf.stepper(case)) + "\n\n"
+        conds = [str(c) for c in pay.get("possible_conditions", [])][:4]
+        if conds:
+            md += (f"**Latest AI assessment:** {RISK_BADGE.get(case['risk_level'], case['risk_level'])} — may point to "
+                   + ", ".join(conds) + " _(AI prediction — not a diagnosis)_\n\n")
+        if pay.get("radiology"):
+            urgent = any(r["verdict"] == wf.RADIOLOGY_VERDICTS[2] for r in pay["radiology"]["reads"])
+            md += "🩻 **Radiologist:** your scans have been read" + (
+                " — an urgent finding was flagged and the care team has been alerted." if urgent else ".") + "\n\n"
+        if tri:
+            md += (f"🧭 **Care coordinator:** priority {wf.PRIORITY_ICON.get(tri['priority'], '')} {tri['priority']}, "
+                   f"assigned to **{tri['clinician_name']}**.\n\n")
+        if case["status"] == wf.VALIDATED:
+            md += f"✅ **Confirmed by {case.get('reviewer') or 'your clinician'}:**\n\n{case.get('final_message') or ''}\n\n"
+        elif case["status"] == wf.RETURNED:
+            md += (f"↩️ **{case.get('reviewer') or 'Your clinician'} asked:** {case.get('review_note') or 'more information'} "
+                   "— reply here or attach a report; it goes into the same case.\n\n")
+        else:
+            md += "**Next:** " + wf.next_step_text(case["status"], tri.get("clinician_name")) + "\n\n"
+        events = pay.get("timeline") or []
+        if events:
+            md += "<details><summary>Timeline</summary>\n\n" + "\n".join(
+                f"- {e['at']} · **{e['actor']}** — {e['event']}" for e in events[-10:]) + "\n\n</details>"
+        return md
 
     # ------------------------------------------------------------------ pipeline
     def _pipeline(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
@@ -378,14 +455,20 @@ class Orchestrator:
                           payload={"insight": insight, "facts": run.analysis.facts_text() if run.analysis else "",
                                    "risk": run.risk.model_dump() if run.risk else {}, "review_reasons": run.review_reasons,
                                    "guard_issues": issues, "sources": run.ext.sources if run.ext else [],
-                                   "possible_conditions": insight.get("possible_conditions", [])},
+                                   "possible_conditions": insight.get("possible_conditions", []),
+                                   **self._care_team_payload(plan.patient_key, run)},
                           patient_draft=draft)
             existing = self.store.open_case(plan.patient_key)
+            unread = wf.unread_imaging(fields["payload"]["imaging"], self.store.read_imaging_docs(plan.patient_key))
             if existing:
                 case_id = existing["case_id"]
-                self.store.update_case(case_id, **fields)
+                status = wf.status_after_patient_update(existing, unread)
+                self.store.update_case(case_id, status=status, **fields)
             else:
-                case_id = self.store.create_case(patient_key=plan.patient_key, created_by=session.username, **fields)
+                status = wf.initial_status(unread)
+                case_id = self.store.create_case(patient_key=plan.patient_key, created_by=session.username, status=status,
+                                                 **fields)
+            assigned = (self.store.case(case_id)["payload"].get("triage") or {}).get("clinician_name")
             turn.case_id = case_id
             md = patient_assessment_markdown(insight, level, draft, issues)
             turn.answers.append({"label": label, "markdown": md, "summary": str((com.output or {}).get("message", ""))[:300]})
@@ -394,10 +477,12 @@ class Orchestrator:
             case_text = (f"📁 **Case {case_id}** — "
                          + ("your open case was **updated** with this question (no new case created). " if existing
                             else "created for you. ")
-                         + "A clinician will check this AI assessment; their confirmed answer will appear here and under "
-                           "**My case updates**. The guidance above applies right now.")
-            yield Event("case", "⏳ Waiting for clinician confirmation", case_text,
-                        data={"case_id": case_id, "updated": bool(existing)})
+                         + f"**Now:** {f'⏳ With {assigned}' if status == wf.CLINICIAN and assigned else wf.STAGE_LABEL[status][0]}. "
+                         + wf.next_step_text(status, assigned)
+                         + " The confirmed answer will appear here and under **My case updates** — ask *“what is the "
+                           "status of my case?”* any time. The guidance above applies right now.")
+            yield Event("case", "📁 Your case with the care team", case_text,
+                        data={"case_id": case_id, "updated": bool(existing), "status": status})
         else:
             md = draft + (("\n\n**🛡️ Guard check before sending:**\n" + "\n".join(f"- ⚠️ {i}" for i in issues))
                           if issues else "\n\n<sub>🛡️ Guard check passed (no doses, no definitive diagnosis).</sub>")
@@ -438,6 +523,19 @@ class Orchestrator:
         yield Event("answer", label, md, data={"agent": "communication"})
 
     # ------------------------------------------------------------------ helpers
+    def _care_team_payload(self, patient_key: str, run: _Run) -> Dict[str, Any]:
+        """What the radiologist and the coordinator need: imaging (for the radiology read), allergies with a contrast
+        safety check, and the report types in the case."""
+        imaging = []
+        for f in (run.analysis.imaging if run.analysis else []):
+            imaging.append({"doc_id": f.section.doc_id, "title": f.section.title, "source": f.source,
+                            "date": f.section.report_date, "impression": f.impression, "red_flags": f.red_flags,
+                            "abnormal": f.abnormal, "text": f.section.text[:2500]})
+        contrast = [alert_line(a) for a in self.engine.safety_alerts(patient_key, ["iodinated contrast"])] if imaging else []
+        domains = {self.engine.store.domain_of(s) for s in (run.ext.sections if run.ext else [])}
+        return {"imaging": imaging, "allergies": run.analysis.allergies if run.analysis else [],
+                "contrast_alerts": contrast, "report_types": sorted(d.value for d in domains if d)}
+
     def _save_symptoms(self, key: str, symptoms: List[str]) -> None:
         known = set(self.engine.kg.patient_symptoms(key))
         for s in symptoms:

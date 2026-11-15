@@ -28,12 +28,16 @@ DOMAIN_NAMES = {Domain.LAB: "lab", Domain.RADIOLOGY: "imaging", Domain.ALLERGY: 
 PERSONAL = re.compile(r"\b(my|me|mine|i|i'm|im|i've|ive|i am|i have|i feel|i got|myself)\b", re.I)
 EXPLAIN = re.compile(r"(explain|translate|write|draft).{0,40}(to|for) (the |my )?patient|patient[- ]friendly|"
                      r"plain (language|english) for", re.I)
+CASE_STATUS_ASK = re.compile(
+    r"\b(status|progress|stage|update[sd]?|where)\b[^.?!]{0,40}\bcase\b|\bcase\b[^.?!]{0,30}\b(status|progress|stage|now)\b|"
+    r"\b(has|have|did)\b[^.?!]{0,25}\b(doctor|clinician|radiologist|coordinator|care team)\b[^.?!]{0,30}"
+    r"\b(see|seen|review|reviewed|read|check|checked|look|looked|confirm|confirmed)\b|what happened (to|with) my case", re.I)
 SAFETY_ASK = re.compile(r"safe|take|give|prescrib|avoid|react|allerg|can (i|he|she|they)", re.I)
 
 
 @dataclass
 class RoutePlan:
-    mode: str = "case"  # case | general | explain
+    mode: str = "case"  # case | general | explain | status
     patient_key: Optional[str] = None
     patient_source: str = ""  # session | question | none
     focus: List[Domain] = field(default_factory=list)
@@ -89,6 +93,12 @@ class Router:
         plan.drugs = kg.resolve_drugs(question)
         plan.allergens = kg.allergens_in_text(question)
         plan.symptoms = kg.symptoms_in_text(question)
+
+        # ---- "where is my case?" — answered from the case workflow, no agents / LLM
+        if plan.patient_key and CASE_STATUS_ASK.search(question) and not (plan.symptoms or plan.drugs or plan.allergens):
+            plan.mode = "status"
+            plan.notes.append("Case-status question — answered from the care-team workflow (no AI call)")
+            return plan
 
         # ---- record domains (RBAC: e.g. radiologists cannot open lab reports)
         wanted = detect_domains(question)

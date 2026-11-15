@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from clinicalchat import workflow as wf
 from clinicalchat.config import Settings, get_settings
 
 SCHEMA = """
@@ -38,8 +39,9 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 USERNAME_RX = re.compile(r"^[a-z][a-z0-9._-]{2,31}$")
 PBKDF2_ROUNDS = 200_000
-CASE_STATUSES = ("PENDING_REVIEW", "VALIDATED", "RETURNED", "MERGED")
-OPEN_STATUSES = ("PENDING_REVIEW", "RETURNED")
+CASE_STATUSES = wf.CASE_STATUSES
+OPEN_STATUSES = wf.OPEN_STATUSES
+_OPEN_SQL = "(" + ",".join(f"'{s}'" for s in OPEN_STATUSES) + ")"
 RISK_ORDER = ["LOW", "MODERATE", "HIGH", "CRITICAL"]
 
 
@@ -120,45 +122,101 @@ class Store:
 
     # ------------------------------------------------------------------ review cases
     def create_case(self, *, patient_key: str, created_by: str, question: str, risk_level: str, escalate: bool,
-                    review_required: bool, payload: Dict[str, Any], patient_draft: str) -> str:
+                    review_required: bool, payload: Dict[str, Any], patient_draft: str, status: str = wf.TRIAGE) -> str:
+        if status not in OPEN_STATUSES:
+            raise ValueError(f"Unknown status {status}")
         case_id = "C-" + uuid.uuid4().hex[:8].upper()
+        payload = {**payload, "timeline": [_event("Patient", "Case opened — AI assessment shared with the patient"),
+                                           _event("System", f"Routed: {wf.STAGE_LABEL[status][0]}")]}
         self._exec("INSERT INTO cases (case_id, patient_key, created_by, question, risk_level, escalate, review_required,"
                    " payload, patient_draft, status, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                    (case_id, patient_key, created_by, question, risk_level, int(escalate), int(review_required),
-                    json.dumps(payload, default=str), patient_draft, "PENDING_REVIEW", _now()))
+                    json.dumps(payload, default=str), patient_draft, status, _now()))
         return case_id
 
     def open_case(self, patient_key: str) -> Optional[Dict[str, Any]]:
-        """The patient's case that a clinician has not closed yet (awaiting review or waiting for more info)."""
-        rows = self._rows("SELECT * FROM cases WHERE patient_key=? AND status IN ('PENDING_REVIEW','RETURNED') "
+        """The patient's case that has not been closed by a clinician yet (anywhere in the care-team workflow)."""
+        rows = self._rows(f"SELECT * FROM cases WHERE patient_key=? AND status IN {_OPEN_SQL} "
                           "ORDER BY created DESC LIMIT 1", (patient_key,))
         return _case(rows[0]) if rows else None
 
     def update_case(self, case_id: str, *, question: str, risk_level: str, escalate: bool, review_required: bool,
-                    payload: Dict[str, Any], patient_draft: str) -> None:
-        """New question / reports for an open case: keep ONE case per patient. The latest assessment replaces the draft,
-        the question history is kept, and the risk level never drops until a clinician has looked at it."""
+                    payload: Dict[str, Any], patient_draft: str, status: Optional[str] = None) -> None:
+        """New question / reports for an open case: keep ONE case per patient. The latest assessment replaces the draft;
+        the question history, radiology read, triage and timeline are kept, and the risk level never drops until a
+        clinician has looked at it."""
         old = self.case(case_id)
         if not old:
             raise ValueError(f"Unknown case {case_id}")
+        status = status or old["status"]
+        if status not in OPEN_STATUSES:
+            raise ValueError(f"Unknown status {status}")
         history = list(old["payload"].get("history") or [{"question": old["question"], "at": old["created"]}])
         history.append({"question": question, "at": _now()})
-        payload = {**payload, "history": history[-20:]}
+        keep = {k: old["payload"][k] for k in ("radiology", "triage", "timeline") if k in old["payload"]}
+        timeline = list(keep.get("timeline") or [])
+        timeline.append(_event("Patient", "Added a message / reports — AI assessment updated"))
+        if status != old["status"]:
+            timeline.append(_event("System", f"Routed: {wf.STAGE_LABEL[status][0]}"))
+        payload = {**payload, **keep, "history": history[-20:], "timeline": timeline[-40:]}
         level = max(old["risk_level"], risk_level, key=lambda x: RISK_ORDER.index(x) if x in RISK_ORDER else 0)
         self._exec("UPDATE cases SET question=?, risk_level=?, escalate=?, review_required=?, payload=?, patient_draft=?, "
-                   "status='PENDING_REVIEW', reviewer=NULL, review_note=NULL, final_message=NULL, delivered=0, reviewed=NULL "
+                   "status=?, reviewer=NULL, review_note=NULL, final_message=NULL, delivered=0, reviewed=NULL "
                    "WHERE case_id=?",
                    (question, level, int(escalate or old["escalate"]), int(review_required or old["review_required"]),
-                    json.dumps(payload, default=str), patient_draft, case_id))
+                    json.dumps(payload, default=str), patient_draft, status, case_id))
+
+    def _save_payload(self, case_id: str, payload: Dict[str, Any], status: str, risk_level: Optional[str] = None) -> None:
+        if risk_level:
+            self._exec("UPDATE cases SET payload=?, status=?, risk_level=? WHERE case_id=?",
+                       (json.dumps(payload, default=str), status, risk_level, case_id))
+        else:
+            self._exec("UPDATE cases SET payload=?, status=? WHERE case_id=?",
+                       (json.dumps(payload, default=str), status, case_id))
+
+    def radiology_read(self, case_id: str, *, reader: str, verdict: str, report: str, doc_ids: List[str]) -> Dict[str, Any]:
+        case = self.case(case_id)
+        if not case or case["status"] != wf.RADIOLOGY:
+            raise ValueError(f"Case {case_id} is not waiting for a radiologist")
+        critical = verdict == wf.RADIOLOGY_VERDICTS[2]
+        pay = case["payload"]
+        reads = list((pay.get("radiology") or {}).get("reads") or [])
+        reads.append({"reader": reader, "verdict": verdict, "report": report, "doc_ids": doc_ids, "at": _now()})
+        pay["radiology"] = {"reads": reads, "doc_ids": sorted({d for r in reads for d in r["doc_ids"]})}
+        status = wf.status_after_radiology(case, critical)
+        pay.setdefault("timeline", []).append(_event(reader, f"Radiology read: {verdict}"))
+        pay["timeline"].append(_event("System", f"Routed: {wf.STAGE_LABEL[status][0]}"))
+        self._save_payload(case_id, pay, status, "CRITICAL" if critical else None)
+        return self.case(case_id)
+
+    def triage(self, case_id: str, *, coordinator: str, priority: str, clinician: str, clinician_name: str,
+               note: str) -> Dict[str, Any]:
+        case = self.case(case_id)
+        if not case or case["status"] != wf.TRIAGE:
+            raise ValueError(f"Case {case_id} is not waiting for triage")
+        if priority not in wf.PRIORITIES:
+            raise ValueError(f"Unknown priority {priority}")
+        pay = case["payload"]
+        pay["triage"] = {"coordinator": coordinator, "priority": priority, "clinician": clinician,
+                         "clinician_name": clinician_name, "note": note, "at": _now()}
+        pay.setdefault("timeline", []).append(
+            _event(coordinator, f"Triaged {wf.PRIORITY_ICON[priority]} {priority} → assigned to {clinician_name}"))
+        self._save_payload(case_id, pay, wf.CLINICIAN)
+        return self.case(case_id)
+
+    def read_imaging_docs(self, patient_key: str) -> List[str]:
+        """Imaging documents of this patient that a radiologist has already read (in any case)."""
+        return sorted({d for c in self.cases(patient_key=patient_key)
+                       for d in (c["payload"].get("radiology") or {}).get("doc_ids", [])})
 
     def consolidate_open_cases(self) -> int:
         """One-time tidy-up: older duplicate open cases of a patient are merged into the newest one."""
         merged = 0
         keys = [r["patient_key"] for r in self._rows(
-            "SELECT patient_key FROM cases WHERE status IN ('PENDING_REVIEW','RETURNED') GROUP BY patient_key HAVING COUNT(*) > 1")]
+            f"SELECT patient_key FROM cases WHERE status IN {_OPEN_SQL} GROUP BY patient_key HAVING COUNT(*) > 1")]
         for key in keys:
-            rows = [_case(r) for r in self._rows("SELECT * FROM cases WHERE patient_key=? AND status IN "
-                                                 "('PENDING_REVIEW','RETURNED') ORDER BY created DESC", (key,))]
+            rows = [_case(r) for r in self._rows(f"SELECT * FROM cases WHERE patient_key=? AND status IN {_OPEN_SQL} "
+                                                 "ORDER BY created DESC", (key,))]
             keep, older = rows[0], rows[1:]
             history = [{"question": c["question"], "at": c["created"]} for c in reversed(older)]
             history += keep["payload"].get("history") or [{"question": keep["question"], "at": keep["created"]}]
@@ -190,12 +248,18 @@ class Store:
     def review_case(self, case_id: str, *, reviewer: str, status: str, note: str, final_message: str) -> None:
         if status not in CASE_STATUSES:
             raise ValueError(f"Unknown status {status}")
-        self._exec("UPDATE cases SET status=?, reviewer=?, review_note=?, final_message=?, reviewed=?, delivered=0 "
-                   "WHERE case_id=?", (status, reviewer, note, final_message, _now(), case_id))
+        case = self.case(case_id)
+        if not case:
+            raise ValueError(f"Unknown case {case_id}")
+        pay = case["payload"]
+        pay.setdefault("timeline", []).append(_event(reviewer, "Confirmed the assessment — case closed" if status == wf.VALIDATED
+                                                     else "Asked the patient for more information"))
+        self._exec("UPDATE cases SET status=?, reviewer=?, review_note=?, final_message=?, reviewed=?, delivered=0, payload=? "
+                   "WHERE case_id=?", (status, reviewer, note, final_message, _now(), json.dumps(pay, default=str), case_id))
 
     def undelivered(self, patient_key: str) -> List[Dict[str, Any]]:
         return [_case(r) for r in self._rows(
-            "SELECT * FROM cases WHERE patient_key=? AND status!='PENDING_REVIEW' AND delivered=0 ORDER BY reviewed",
+            "SELECT * FROM cases WHERE patient_key=? AND status IN ('VALIDATED','RETURNED') AND delivered=0 ORDER BY reviewed",
             (patient_key,))]
 
     def mark_delivered(self, case_id: str) -> None:
@@ -208,6 +272,10 @@ class Store:
 
     def recent_feedback(self, limit: int = 3) -> List[Dict[str, Any]]:
         return self._rows("SELECT * FROM feedback WHERE note != '' ORDER BY id DESC LIMIT ?", (limit,))
+
+
+def _event(actor: str, text: str) -> Dict[str, str]:
+    return {"at": _now(), "actor": actor, "event": text}
 
 
 def _case(row: Dict[str, Any]) -> Dict[str, Any]:
