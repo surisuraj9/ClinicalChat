@@ -44,6 +44,7 @@ Routing rules:
 - Imaging (X-ray, CT, MRI, ultrasound) not yet read by a radiologist → radiologist first. **Allergy-only reports do not go to the radiologist**; the radiologist sees allergies only to judge contrast safety.
 - A **critical** radiology read raises the case to CRITICAL and sends it back to triage, even if it was already assigned.
 - A patient reply to a returned case goes straight back to the assigned clinician, unless it adds new imaging (then radiologist first).
+- **AI busy or rate-limited?** The case is still created and routed. It uses the rule-based findings (risk, abnormal values, imaging flags), so reports always reach the care team. The patient gets the AI explanation by asking again, and that updates the same case.
 - Each stage is checked server-side (a clinician cannot confirm an un-triaged case, the coordinator cannot triage before the radiology read, and only clinicians can be assigned). Every step is written to the case timeline and the audit log.
 
 ### LLM budget (important with rate-limited back ends)

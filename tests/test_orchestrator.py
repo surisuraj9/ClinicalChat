@@ -293,3 +293,27 @@ def test_iodine_allergy_flags_contrast_for_radiologist(orch, fake_llm, engine, s
     engine.apply_fact(key, "allergy", "iodine")
     alerts = engine.safety_alerts(key, ["iodinated contrast"])
     assert alerts and alerts[0].level == "CONTRAINDICATED"
+
+
+def test_case_is_filed_and_routed_even_when_the_ai_is_rate_limited(engine, store, tmp_path):
+    from conftest import FakeLLM
+    from clinicalchat.audit import Auditor
+    from clinicalchat.config import Settings
+    from clinicalchat.orchestrator import Orchestrator
+
+    class RateLimited(FakeLLM):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            raise RuntimeError("HTTP 429: rate limit exceeded")
+
+    orch = Orchestrator(engine, llm=RateLimited(cache=False, calls=[]), auditor=Auditor(Settings(work_dir=tmp_path)),
+                        store=store)
+    s = _session(Role.PATIENT, own="meera-nair-47", username="meera")
+    events = orch.run("Explain my CT scan report", s)
+    case_ev = next(e for e in events if e.kind == "case")
+    answer = next(e for e in events if e.kind == "answer")
+    assert "busy" in answer.text and "not a diagnosis" in answer.text and answer.data["case_id"] == case_ev.data["case_id"]
+    case = store.case(case_ev.data["case_id"])
+    # imaging still reaches the radiologist; the clinician has a rule-based draft to approve or edit
+    assert case["status"] == "AWAITING_RADIOLOGY" and case["payload"]["insight"]["ai_unavailable"]
+    assert "Overall risk" in case["patient_draft"] and "busy" not in case["patient_draft"]
+    assert any("AI explanation unavailable" in r for r in case["payload"]["review_reasons"])

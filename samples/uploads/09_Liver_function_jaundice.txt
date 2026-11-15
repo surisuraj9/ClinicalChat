@@ -1,0 +1,17 @@
+Sunrise Diagnostics, 12 MG Road, Bengaluru
+LIVER FUNCTION TEST (LFT)
+Patient Name: Robin Hood
+Age / Gender: 31 Years / Male
+Referred By: Self
+Report Date: 12-11-2026
+
+Test | Result | Unit | Reference Range | Flag
+Total Bilirubin | 4.8 | mg/dL | 0.2 - 1.2 | High
+Direct Bilirubin | 3.1 | mg/dL | 0.0 - 0.3 | High
+ALT (SGPT) | 312 | U/L | 7 - 56 | High
+AST (SGOT) | 268 | U/L | 10 - 40 | High
+Alkaline Phosphatase | 190 | U/L | 44 - 147 | High
+Albumin | 3.9 | g/dL | 3.5 - 5.0 |
+HBsAg | Non-reactive | | Non-reactive |
+
+Comment: Hepatocellular pattern of liver injury. Suggest viral hepatitis panel (HAV IgM, HEV IgM).

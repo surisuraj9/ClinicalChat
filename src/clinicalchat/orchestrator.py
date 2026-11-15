@@ -426,7 +426,9 @@ class Orchestrator:
 
         # 5) 💬 Patient Communication (LLM) — patients: held for clinician validation
         if ins.error:
-            if is_patient:
+            if is_patient and plan.patient_key:
+                yield from self._file_case_without_ai(question, session, plan, turn, run, ins.error)
+            elif is_patient:
                 yield Event("answer", "💬 Patient Communication", "_The AI assistant is busy right now, so I could not prepare "
                             "a written explanation. The safety guidance above still applies — please try again shortly._",
                             data={"agent": "communication"})
@@ -444,50 +446,90 @@ class Orchestrator:
         run.llm.append(com)
         yield Event("status", f"{label} — {'failed' if com.error else 'done'}", _timing(com), "done", "agent-communication")
         if com.error:
+            if is_patient and plan.patient_key:
+                yield from self._file_case_without_ai(question, session, plan, turn, run, com.error, insight)
+                return
             yield Event("answer", label, f"_Could not write the explanation right now._ {com.error}", data={"agent": "communication"})
             return
         draft = communication_markdown(com.output or {})
         issues = check_patient_text([draft], abnormal)
         if is_patient and plan.patient_key:
             level = run.risk.risk_level if run.risk else risk_level
-            fields = dict(question=question, risk_level=level, escalate=bool(run.risk and run.risk.escalate),
-                          review_required=bool(run.review_reasons or issues),
-                          payload={"insight": insight, "facts": run.analysis.facts_text() if run.analysis else "",
-                                   "risk": run.risk.model_dump() if run.risk else {}, "review_reasons": run.review_reasons,
-                                   "guard_issues": issues, "sources": run.ext.sources if run.ext else [],
-                                   "possible_conditions": insight.get("possible_conditions", []),
-                                   **self._care_team_payload(plan.patient_key, run)},
-                          patient_draft=draft)
-            existing = self.store.open_case(plan.patient_key)
-            unread = wf.unread_imaging(fields["payload"]["imaging"], self.store.read_imaging_docs(plan.patient_key))
-            if existing:
-                case_id = existing["case_id"]
-                status = wf.status_after_patient_update(existing, unread)
-                self.store.update_case(case_id, status=status, **fields)
-            else:
-                status = wf.initial_status(unread)
-                case_id = self.store.create_case(patient_key=plan.patient_key, created_by=session.username, status=status,
-                                                 **fields)
-            assigned = (self.store.case(case_id)["payload"].get("triage") or {}).get("clinician_name")
-            turn.case_id = case_id
             md = patient_assessment_markdown(insight, level, draft, issues)
             turn.answers.append({"label": label, "markdown": md, "summary": str((com.output or {}).get("message", ""))[:300]})
-            yield Event("answer", "🩺 Your health picture — AI assessment", md, data={"agent": "communication",
-                                                                                      "case_id": case_id})
-            case_text = (f"📁 **Case {case_id}** — "
-                         + ("your open case was **updated** with this question (no new case created). " if existing
-                            else "created for you. ")
-                         + f"**Now:** {f'⏳ With {assigned}' if status == wf.CLINICIAN and assigned else wf.STAGE_LABEL[status][0]}. "
-                         + wf.next_step_text(status, assigned)
-                         + " The confirmed answer will appear here and under **My case updates** — ask *“what is the "
-                           "status of my case?”* any time. The guidance above applies right now.")
-            yield Event("case", "📁 Your case with the care team", case_text,
-                        data={"case_id": case_id, "updated": bool(existing), "status": status})
+            yield from self._file_case(question, session, plan, turn, run, insight, level, draft, issues, md)
         else:
             md = draft + (("\n\n**🛡️ Guard check before sending:**\n" + "\n".join(f"- ⚠️ {i}" for i in issues))
                           if issues else "\n\n<sub>🛡️ Guard check passed (no doses, no definitive diagnosis).</sub>")
             turn.answers.append({"label": label, "markdown": md, "summary": str((com.output or {}).get("message", ""))[:300]})
             yield Event("answer", f"{label} — patient-friendly draft", md, data={"agent": "communication"})
+
+    def _file_case(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
+                   insight: Dict[str, Any], level: str, draft: str, issues: List[str], md: str) -> Iterator[Event]:
+        """Save the patient's case (reusing the open one) and route it to the care team."""
+        fields = dict(question=question, risk_level=level, escalate=bool(run.risk and run.risk.escalate),
+                      review_required=bool(run.review_reasons or issues),
+                      payload={"insight": insight, "facts": run.analysis.facts_text() if run.analysis else "",
+                               "risk": run.risk.model_dump() if run.risk else {}, "review_reasons": run.review_reasons,
+                               "guard_issues": issues, "sources": run.ext.sources if run.ext else [],
+                               "possible_conditions": insight.get("possible_conditions", []),
+                               **self._care_team_payload(plan.patient_key, run)},
+                      patient_draft=draft)
+        existing = self.store.open_case(plan.patient_key)
+        unread = wf.unread_imaging(fields["payload"]["imaging"], self.store.read_imaging_docs(plan.patient_key))
+        if existing:
+            case_id = existing["case_id"]
+            status = wf.status_after_patient_update(existing, unread)
+            self.store.update_case(case_id, status=status, **fields)
+        else:
+            status = wf.initial_status(unread)
+            case_id = self.store.create_case(patient_key=plan.patient_key, created_by=session.username, status=status,
+                                             **fields)
+        assigned = (self.store.case(case_id)["payload"].get("triage") or {}).get("clinician_name")
+        turn.case_id = case_id
+        yield Event("answer", "🩺 Your health picture — AI assessment", md, data={"agent": "communication",
+                                                                                  "case_id": case_id})
+        case_text = (f"📁 **Case {case_id}** — "
+                     + ("your open case was **updated** with this question (no new case created). " if existing
+                        else "created for you. ")
+                     + f"**Now:** {f'⏳ With {assigned}' if status == wf.CLINICIAN and assigned else wf.STAGE_LABEL[status][0]}. "
+                     + wf.next_step_text(status, assigned)
+                     + " The confirmed answer will appear here and under **My case updates** — ask *“what is the "
+                       "status of my case?”* any time. The guidance above applies right now.")
+        yield Event("case", "📁 Your case with the care team", case_text,
+                    data={"case_id": case_id, "updated": bool(existing), "status": status})
+
+    def _file_case_without_ai(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
+                              error: str, insight: Optional[Dict[str, Any]] = None) -> Iterator[Event]:
+        """The AI is unavailable (e.g. rate-limited): still file and route the case from the rule-based agents'
+        findings, so reports — especially critical ones — always reach the care team."""
+        an, level = run.analysis, (run.risk.risk_level if run.risk else "MODERATE")
+        reason = "AI explanation unavailable (service busy) — rule-based findings only"
+        if reason not in run.review_reasons:
+            run.review_reasons.append(reason)
+        conditions = list((insight or {}).get("possible_conditions") or (an.possible_conditions if an else []))[:5]
+        findings = [r.line() for r, _ in (an.abnormal if an else [])][:8]
+        for f in (an.imaging if an else [])[:4]:
+            notes = f.red_flags[:2] or f.abnormal[:2]
+            if notes:
+                findings.append(f"{f.section.title or 'Imaging'}: " + "; ".join(notes))
+        fallback = {**(insight or {}), "possible_conditions": conditions, "ai_unavailable": True,
+                    "answer": (insight or {}).get("answer") or "AI unavailable — rule-based findings only.",
+                    "confidence": (insight or {}).get("confidence", 0)}
+        body = ""
+        if findings:
+            body += "\n\n**What the automatic checks found in your reports:**\n" + "\n".join(f"- {x}" for x in findings)
+        if conditions:
+            body += ("\n\n**These findings can be seen with** _(not a diagnosis)_:\n" + "\n".join(f"- {c}" for c in conditions))
+        risk_line = f"**Overall risk:** {RISK_BADGE.get(level, level)}"
+        draft = risk_line + body + "\n\nPlease discuss these results with your clinician."
+        md = risk_line + " · _rule-based check (AI busy)_" + body
+        md += ("\n\n_The AI assistant is busy right now, so I couldn't write a full explanation. Your reports have still "
+               "been sent to the care team, who will review them. Ask again in a few minutes for the full explanation — "
+               "it will update this same case._")
+        md += "\n\n<sub>🤖 Automatic rule-based check — not a diagnosis. A clinician will confirm or correct it.</sub>"
+        turn.answers.append({"label": AGENT_LABELS[AgentName.COMMUNICATION], "markdown": md, "summary": reason})
+        yield from self._file_case(question, session, plan, turn, run, fallback, level, draft, [], md)
 
     def _explain_last(self, question: str, session: ChatSession, turn: Turn, run: _Run) -> Iterator[Event]:
         last = session.last_insight or {}
