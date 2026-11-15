@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 USERNAME_RX = re.compile(r"^[a-z][a-z0-9._-]{2,31}$")
 PBKDF2_ROUNDS = 200_000
-CASE_STATUSES = ("PENDING_REVIEW", "VALIDATED", "RETURNED")
+CASE_STATUSES = ("PENDING_REVIEW", "VALIDATED", "RETURNED", "MERGED")
+OPEN_STATUSES = ("PENDING_REVIEW", "RETURNED")
+RISK_ORDER = ["LOW", "MODERATE", "HIGH", "CRITICAL"]
 
 
 def _now() -> str:
@@ -59,6 +61,7 @@ class Store:
         self._lock = threading.Lock()
         with self._conn() as c:
             c.executescript(SCHEMA)
+        self.consolidate_open_cases()
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10)
@@ -124,6 +127,50 @@ class Store:
                    (case_id, patient_key, created_by, question, risk_level, int(escalate), int(review_required),
                     json.dumps(payload, default=str), patient_draft, "PENDING_REVIEW", _now()))
         return case_id
+
+    def open_case(self, patient_key: str) -> Optional[Dict[str, Any]]:
+        """The patient's case that a clinician has not closed yet (awaiting review or waiting for more info)."""
+        rows = self._rows("SELECT * FROM cases WHERE patient_key=? AND status IN ('PENDING_REVIEW','RETURNED') "
+                          "ORDER BY created DESC LIMIT 1", (patient_key,))
+        return _case(rows[0]) if rows else None
+
+    def update_case(self, case_id: str, *, question: str, risk_level: str, escalate: bool, review_required: bool,
+                    payload: Dict[str, Any], patient_draft: str) -> None:
+        """New question / reports for an open case: keep ONE case per patient. The latest assessment replaces the draft,
+        the question history is kept, and the risk level never drops until a clinician has looked at it."""
+        old = self.case(case_id)
+        if not old:
+            raise ValueError(f"Unknown case {case_id}")
+        history = list(old["payload"].get("history") or [{"question": old["question"], "at": old["created"]}])
+        history.append({"question": question, "at": _now()})
+        payload = {**payload, "history": history[-20:]}
+        level = max(old["risk_level"], risk_level, key=lambda x: RISK_ORDER.index(x) if x in RISK_ORDER else 0)
+        self._exec("UPDATE cases SET question=?, risk_level=?, escalate=?, review_required=?, payload=?, patient_draft=?, "
+                   "status='PENDING_REVIEW', reviewer=NULL, review_note=NULL, final_message=NULL, delivered=0, reviewed=NULL "
+                   "WHERE case_id=?",
+                   (question, level, int(escalate or old["escalate"]), int(review_required or old["review_required"]),
+                    json.dumps(payload, default=str), patient_draft, case_id))
+
+    def consolidate_open_cases(self) -> int:
+        """One-time tidy-up: older duplicate open cases of a patient are merged into the newest one."""
+        merged = 0
+        keys = [r["patient_key"] for r in self._rows(
+            "SELECT patient_key FROM cases WHERE status IN ('PENDING_REVIEW','RETURNED') GROUP BY patient_key HAVING COUNT(*) > 1")]
+        for key in keys:
+            rows = [_case(r) for r in self._rows("SELECT * FROM cases WHERE patient_key=? AND status IN "
+                                                 "('PENDING_REVIEW','RETURNED') ORDER BY created DESC", (key,))]
+            keep, older = rows[0], rows[1:]
+            history = [{"question": c["question"], "at": c["created"]} for c in reversed(older)]
+            history += keep["payload"].get("history") or [{"question": keep["question"], "at": keep["created"]}]
+            payload = {**keep["payload"], "history": history[-20:]}
+            level = max([c["risk_level"] for c in rows], key=lambda x: RISK_ORDER.index(x) if x in RISK_ORDER else 0)
+            self._exec("UPDATE cases SET payload=?, risk_level=? WHERE case_id=?",
+                       (json.dumps(payload, default=str), level, keep["case_id"]))
+            for c in older:
+                self._exec("UPDATE cases SET status='MERGED', review_note=?, delivered=1 WHERE case_id=?",
+                           (f"merged into {keep['case_id']}", c["case_id"]))
+                merged += 1
+        return merged
 
     def case(self, case_id: str) -> Optional[Dict[str, Any]]:
         rows = self._rows("SELECT * FROM cases WHERE case_id=?", (case_id,))

@@ -33,8 +33,10 @@ def test_patient_case_is_held_for_clinician_review(orch, fake_llm, store):
     events = orch.run("Explain my CBC report", s)
     assert _agent_order(events) == ["extraction", "analysis", "risk", "insight", "communication"]
     assert len(fake_llm.calls) == 2 and "PATIENT COMMUNICATION" in fake_llm.calls[1]
-    assert not any(e.kind == "answer" for e in events)  # the AI draft is NOT shown before validation
+    answer = next(e for e in events if e.kind == "answer")  # AI assessment shown straight away, with the case id
+    assert "Anaemia" in answer.text and "not a diagnosis" in answer.text and "COMMUNICATION answer" in answer.text
     case_ev = next(e for e in events if e.kind == "case")
+    assert answer.data["case_id"] == case_ev.data["case_id"] and case_ev.data["case_id"] in case_ev.text
     case = store.case(case_ev.data["case_id"])
     assert case["status"] == "PENDING_REVIEW" and "COMMUNICATION answer" in case["patient_draft"]
     assert store.undelivered("ananya-rao-54") == []
@@ -46,6 +48,30 @@ def test_patient_case_is_held_for_clinician_review(orch, fake_llm, store):
     # learnability: the next insight prompt includes the clinician's feedback
     orch.run("Interpret this patient's CBC results.", _session(Role.CLINICIAN, selected="ananya-rao-54"))
     assert "Iron studies booked." in fake_llm.calls[-1]
+
+
+def test_one_open_case_per_patient_is_updated_not_duplicated(orch, fake_llm, store):
+    s = _session(Role.PATIENT, own="rahul-mehta-32", username="rahul.mehta")
+    first = next(e for e in orch.run("Explain my thyroid results", s) if e.kind == "case")
+    second = next(e for e in orch.run("Based on my reports what is my current health condition?", s) if e.kind == "case")
+    assert first.data["case_id"] == second.data["case_id"] and second.data["updated"] and "updated" in second.text
+    cases = store.cases(patient_key="rahul-mehta-32")
+    assert len(cases) == 1 and [h["question"] for h in cases[0]["payload"]["history"]] == [
+        "Explain my thyroid results", "Based on my reports what is my current health condition?"]
+    orch.review(first.data["case_id"], "Dr. Neha Sharma", approve=True)  # closed -> the next question opens a new case
+    third = next(e for e in orch.run("I have a headache since yesterday", s) if e.kind == "case")
+    assert third.data["case_id"] != first.data["case_id"] and not third.data["updated"]
+
+
+def test_duplicate_open_cases_are_consolidated(store):
+    kw = dict(created_by="x", escalate=False, review_required=False, payload={}, patient_draft="d")
+    a = store.create_case(patient_key="p-1", question="q1", risk_level="HIGH", **kw)
+    b = store.create_case(patient_key="p-1", question="q2", risk_level="LOW", **kw)
+    assert store.consolidate_open_cases() == 1
+    open_ = [c for c in store.cases(patient_key="p-1") if c["status"] == "PENDING_REVIEW"]
+    assert len(open_) == 1 and open_[0]["risk_level"] == "HIGH"
+    assert {open_[0]["case_id"]} < {a, b} and len(open_[0]["payload"]["history"]) == 2
+    assert store.undelivered("p-1") == []  # merged case is not pushed to the patient
 
 
 def test_new_symptoms_saved_and_red_flag_guidance_is_immediate(orch, fake_llm, engine, store):

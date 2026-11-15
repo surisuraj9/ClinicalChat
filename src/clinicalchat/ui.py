@@ -114,9 +114,10 @@ button.cc-chip:hover {background:#eef2ff !important; border-color:#c7d2fe !impor
 .cc-agent.denied {border-color:#fcd34d; background:#fffbeb; opacity:1;}
 .cc-agent.skipped {background:#f8fafc; opacity:.75;}
 .cc-agent .ak {font-size:10.5px; color:#9ca3af; font-weight:600; letter-spacing:.04em;}
-.cc-case {display:flex; justify-content:space-between; gap:8px; font-size:12.5px; padding:5px 0; border-bottom:1px dashed #eef0f4;}
+.cc-case {font-size:12.5px; padding:6px 0; border-bottom:1px dashed #eef0f4;}
+.cc-case .top {display:flex; justify-content:space-between; gap:8px;}
+.cc-case .sub {color:#6b7280; font-size:11.5px; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
 .cc-case:last-child {border-bottom:none;}
-.cc-case > span:first-child {white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;}
 .cc-case .st {white-space:nowrap; font-weight:600;}
 .cc-badge {display:inline-block; min-width:20px; padding:0 7px; border-radius:999px; background:#4f46e5; color:#fff; font-size:11px;
   font-weight:700; text-align:center; margin-left:6px; text-transform:none; letter-spacing:0;}
@@ -135,8 +136,17 @@ button.cc-chip:hover {background:#eef2ff !important; border-color:#c7d2fe !impor
 .cc-input {gap:8px !important;}
 .cc-input button, .cc-input .cc-up button {height:42px !important; white-space:nowrap !important; width:116px !important; min-width:116px !important;
   flex:0 0 116px !important; font-size:14px !important; font-weight:600 !important; padding:0 10px !important; border-radius:10px !important;}
-.cc-input button.cc-attach {width:70px !important; min-width:70px !important; flex:0 0 70px !important;
-  background:#eef2ff !important; border:1px solid #c7d2fe !important; color:#3730a3 !important; box-shadow:none !important;}
+.cc-input .cc-attach {flex:0 1 360px !important; max-width:40% !important; min-width:200px !important; overflow:visible !important;}
+.cc-input .cc-attach .wrap {background:#eef2ff !important; border:1px solid #c7d2fe !important; border-radius:10px !important;
+  padding:3px 4px !important; min-height:40px;}
+.cc-input .cc-attach .wrap-inner {flex-wrap:nowrap !important; overflow-x:auto !important; gap:4px !important;
+  scrollbar-width:thin; align-items:center;}
+.cc-input .cc-attach .token {flex:0 0 auto !important; background:#fff !important; border:1px solid #c7d2fe !important;
+  color:#3730a3 !important; font-size:12.5px !important; padding:2px 6px !important; margin:0 !important; white-space:nowrap;}
+.cc-input .cc-attach .token-remove {color:#4338ca !important;}
+.cc-input .cc-attach .secondary-wrap {flex:0 0 auto !important; width:auto !important;}
+.cc-input .cc-attach .secondary-wrap input {display:none !important;}
+.cc-input .cc-attach .icon-wrap {display:none !important;}
 .cc-input button.cc-sec {background:#f8fafc !important; border:1px solid #e2e8f0 !important; color:#1f2937 !important; box-shadow:none !important;}
 footer {display:none !important;}
 @media (max-width: 900px) {.cc-main {flex-wrap:wrap !important;} .cc-side {height:auto;} .cc-agents {grid-template-columns:repeat(2, 1fr);}}
@@ -235,15 +245,21 @@ RISK_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "�
 def my_cases_html(session: Optional[ChatSession]) -> str:
     if session is None or not session.own_patient:
         return ""
-    cases = sorted(get_store().cases(patient_key=session.own_patient), key=lambda c: c["created"], reverse=True)[:4]
+    cases = [c for c in get_store().cases(patient_key=session.own_patient) if c["status"] in CASE_STATUS]
+    cases.sort(key=lambda c: c["created"], reverse=True)
+    cases.sort(key=lambda c: c["status"] not in ("PENDING_REVIEW", "RETURNED"))  # open case first, then newest
+    cases = cases[:4]
     if not cases:
-        return "<div class='cc-muted'>No updates yet. When the agents prepare an explanation for you, a clinician checks it first — it will appear here and in the chat.</div>"
+        return "<div class='cc-muted'>No case yet. After you describe symptoms or attach reports, the AI assessment opens one case for you; a clinician then confirms it.</div>"
     rows = []
     for c in cases:
         label, color = CASE_STATUS[c["status"]]
-        q = html.escape(c["question"][:42] + ("…" if len(c["question"]) > 42 else ""))
-        rows.append(f"<div class='cc-case'><span title='{html.escape(c['question'])}'>{q}</span>"
-                    f"<span class='st' style='color:{color}'>{label}</span></div>")
+        n = len(c["payload"].get("history") or [None])
+        tip = html.escape(" | ".join(h["question"] for h in c["payload"].get("history", [])) or c["question"])
+        last = (c["payload"].get("history") or [{"question": c["question"]}])[-1]["question"] or "report upload"
+        sub = f"{n} message{'s' if n > 1 else ''} · last: {html.escape(last)}"
+        rows.append(f"<div class='cc-case' title='{tip}'><div class='top'><b>{c['case_id']}</b>"
+                    f"<span class='st' style='color:{color}'>{label}</span></div><div class='sub'>{sub}</div></div>")
     return "".join(rows)
 
 
@@ -261,13 +277,21 @@ def review_title(n: int) -> str:
     return f"<div class='cc-h'>Review queue<span class='cc-badge'>{n}</span></div>"
 
 
+def _case_questions(case: dict) -> str:
+    hist = case["payload"].get("history") or []
+    if len(hist) <= 1:
+        return f"**Patient asked:** {case['question']}  \n"
+    return ("**Patient messages in this case:**\n" + "\n".join(f"{i}. {h['question']} _({h['at']})_" for i, h in
+                                                             enumerate(hist, 1)) + "\n\n")
+
+
 def case_markdown(case: dict) -> str:
     engine = get_engine()
     p = engine.patient(case["patient_key"])
     pay = case["payload"]
     ins = pay.get("insight", {})
     md = (f"### 🩺 Case {case['case_id']} — {p.label if p else case['patient_key']}\n"
-          f"**Patient asked:** {case['question']}  \n**Risk:** {RISK_ICON.get(case['risk_level'], '')} {case['risk_level']}"
+          + _case_questions(case) + f"**Risk:** {RISK_ICON.get(case['risk_level'], '')} {case['risk_level']}"
           + (" · escalated" if case["escalate"] else ""))
     if pay.get("review_reasons"):
         md += "\n\n> 🟠 **Review Required** — " + "; ".join(pay["review_reasons"])
@@ -277,7 +301,7 @@ def case_markdown(case: dict) -> str:
         md += f"\n\n**💡 Clinical insight** (confidence {ins.get('confidence', 0):.0%})\n{ins['answer']}"
         if ins.get("next_steps"):
             md += "\n\n**Next steps:** " + "; ".join(map(str, ins["next_steps"]))
-    md += "\n\n---\n**💬 Draft for the patient:**\n\n" + "\n".join("> " + line for line in case["patient_draft"].splitlines())
+    md += "\n\n---\n**💬 Shown to the patient as an AI assessment (latest):**\n\n" + "\n".join("> " + line for line in case["patient_draft"].splitlines())
     if pay.get("guard_issues"):
         md += "\n\n**🛡️ Guard flags:** " + "; ".join(pay["guard_issues"])
     md += "\n\n_Add an optional note on the left, then **Approve & send** or **Return**._"
@@ -319,7 +343,7 @@ def welcome(persona: Persona) -> List[dict]:
                 "or ask any health question.\n\nFive agents work on your message: **📄 Data Extraction** reads your records, "
                 "**🔬 Clinical Analysis** checks values, scans, allergies and symptoms, **🚨 Risk Detection** tells you right "
                 "away if you need urgent care, **💡 Insight Generation** prepares a summary for your clinician and "
-                "**💬 Patient Communication** writes a plain-language explanation that a clinician checks before you see it.")
+                "**💬 Patient Communication** explains it in plain language right away, with your **case ID** — a clinician then confirms or corrects it.")
     elif persona.role == Role.CLINICIAN:
         body = ("Pick a patient on the left (or name one in your question). Each question runs the 5-agent pipeline; "
                 "patient cases waiting for your validation are in the **Review queue**.")
@@ -452,16 +476,17 @@ DEFAULT_PLACEHOLDER = "Type a message and press Enter · 📎 Attach to add repo
 
 
 def attach_label(paths: List[str]) -> dict:
+    """One removable chip per attached file (click × on a chip to drop just that file)."""
     if not paths:
-        return gr.update(visible=False, value="")
-    return gr.update(visible=True, value=f"📎 {len(paths)} ✕")
+        return gr.update(visible=False, choices=[], value=[])
+    choices = [(f"📎 {Path(p).name}", p) for p in paths]
+    return gr.update(visible=True, choices=choices, value=list(paths))
 
 
 def attach_placeholder(paths: List[str]) -> dict:
     if not paths:
         return gr.update(placeholder=DEFAULT_PLACEHOLDER)
-    names = ", ".join(Path(p).name for p in paths)
-    return gr.update(placeholder=f"Attached: {names} — add a message (optional) and press Send")
+    return gr.update(placeholder="Add a message (optional) and press Send")
 
 
 def attach_files(files, attached: List[str], session: Optional[ChatSession]):
@@ -477,6 +502,14 @@ def attach_files(files, attached: List[str], session: Optional[ChatSession]):
 
 def clear_attachments():
     return [], attach_label([]), attach_placeholder([])
+
+
+def update_attachments(selected: Optional[List[str]], attached: List[str]):
+    """A chip was removed: keep only the files still selected (order preserved)."""
+    keep = [p for p in (attached or []) if p in set(selected or [])]
+    if keep == list(attached or []):
+        return gr.update(), gr.update(), gr.update()
+    return keep, attach_label(keep), attach_placeholder(keep)
 
 
 def respond_with_files(message: str, history: List[dict], session: Optional[ChatSession], attached: List[str]):
@@ -513,12 +546,13 @@ def deliver_updates(session: Optional[ChatSession], history: List[dict]) -> Opti
         who = c.get("reviewer") or "your clinician"
         if c["status"] == "VALIDATED":
             history.append({"role": "assistant", "content":
-                            f"### ✅ Reviewed by {who}\n_Your question: “{c['question']}”_\n\n{c['final_message']}"})
+                            f"### ✅ Case {c['case_id']} confirmed by {who}\n_Latest question: “{c['question']}”_\n\n"
+                            f"{c['final_message']}"})
         else:
             note = c.get("review_note") or "Your clinician needs a little more information."
             history.append({"role": "assistant", "content":
-                            f"### ↩️ {who} needs more information\n_Your question: “{c['question']}”_\n\n{note}\n\n"
-                            "You can reply here (for example describe your symptoms in more detail) or upload a report with 📎."})
+                            f"### ↩️ Case {c['case_id']} — {who} needs more information\n_Latest question: “{c['question']}”_\n\n{note}\n\n"
+                            "You can reply here (for example describe your symptoms in more detail) or attach a report with 📎 Attach — it will be added to the same case."})
         store.mark_delivered(c["case_id"])
     return history
 
@@ -574,7 +608,9 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
                 with gr.Row(elem_classes="cc-input"):
                     msg = gr.Textbox(placeholder=DEFAULT_PLACEHOLDER, show_label=False, scale=8,
                                      autofocus=True, container=False)
-                    attach_chip = gr.Button("", scale=0, min_width=70, elem_classes="cc-attach", visible=False)
+                    attach_chip = gr.Dropdown(choices=[], value=[], multiselect=True, show_label=False, container=False,
+                                              interactive=True, scale=4, min_width=160, elem_classes="cc-attach",
+                                              visible=False, filterable=False)
                     send = gr.Button("Send ➤", variant="primary", scale=0, min_width=116)
                     upload_btn = gr.UploadButton("📎 Attach", file_types=list(SUPPORTED_UPLOADS), file_count="multiple",
                                                  scale=0, min_width=116, elem_classes="cc-sec", visible=False)
@@ -650,7 +686,8 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
         for chip in chips:
             chip.click(respond, [chip, chatbot, session], outputs, concurrency_limit=4).then(after_turn, session, post)
         upload_btn.upload(attach_files, [upload_btn, attached, session], [attached, attach_chip, msg])
-        attach_chip.click(clear_attachments, None, [attached, attach_chip, msg])
+        attach_chip.change(update_attachments, [attach_chip, attached], [attached, attach_chip, msg],
+                           show_progress="hidden")
 
         # ---------------- clinician review queue
         def open_case(case_id: Optional[str], history: List[dict], s: Optional[ChatSession]):

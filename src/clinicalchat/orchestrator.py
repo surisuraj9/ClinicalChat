@@ -372,22 +372,32 @@ class Orchestrator:
         draft = communication_markdown(com.output or {})
         issues = check_patient_text([draft], abnormal)
         if is_patient and plan.patient_key:
-            case_id = self.store.create_case(
-                patient_key=plan.patient_key, created_by=session.username, question=question,
-                risk_level=run.risk.risk_level if run.risk else risk_level,
-                escalate=bool(run.risk and run.risk.escalate), review_required=bool(run.review_reasons or issues),
-                payload={"insight": insight, "facts": run.analysis.facts_text() if run.analysis else "",
-                         "risk": run.risk.model_dump() if run.risk else {}, "review_reasons": run.review_reasons,
-                         "guard_issues": issues, "sources": run.ext.sources if run.ext else [],
-                         "possible_conditions": insight.get("possible_conditions", [])},
-                patient_draft=draft)
+            level = run.risk.risk_level if run.risk else risk_level
+            fields = dict(question=question, risk_level=level, escalate=bool(run.risk and run.risk.escalate),
+                          review_required=bool(run.review_reasons or issues),
+                          payload={"insight": insight, "facts": run.analysis.facts_text() if run.analysis else "",
+                                   "risk": run.risk.model_dump() if run.risk else {}, "review_reasons": run.review_reasons,
+                                   "guard_issues": issues, "sources": run.ext.sources if run.ext else [],
+                                   "possible_conditions": insight.get("possible_conditions", [])},
+                          patient_draft=draft)
+            existing = self.store.open_case(plan.patient_key)
+            if existing:
+                case_id = existing["case_id"]
+                self.store.update_case(case_id, **fields)
+            else:
+                case_id = self.store.create_case(patient_key=plan.patient_key, created_by=session.username, **fields)
             turn.case_id = case_id
-            turn.answers.append({"label": label, "markdown": f"_Explanation sent to a clinician for review (case {case_id})._",
-                                 "summary": "Sent to clinician for review"})
-            yield Event("case", "📨 Sent for clinician review",
-                        f"Your explanation has been prepared and sent to a clinician to check (case **{case_id}**). "
-                        "You will see it here as soon as it is approved — usually within the day. "
-                        "The safety guidance above applies right now.", data={"case_id": case_id})
+            md = patient_assessment_markdown(insight, level, draft, issues)
+            turn.answers.append({"label": label, "markdown": md, "summary": str((com.output or {}).get("message", ""))[:300]})
+            yield Event("answer", "🩺 Your health picture — AI assessment", md, data={"agent": "communication",
+                                                                                      "case_id": case_id})
+            case_text = (f"📁 **Case {case_id}** — "
+                         + ("your open case was **updated** with this question (no new case created). " if existing
+                            else "created for you. ")
+                         + "A clinician will check this AI assessment; their confirmed answer will appear here and under "
+                           "**My case updates**. The guidance above applies right now.")
+            yield Event("case", "⏳ Waiting for clinician confirmation", case_text,
+                        data={"case_id": case_id, "updated": bool(existing)})
         else:
             md = draft + (("\n\n**🛡️ Guard check before sending:**\n" + "\n".join(f"- ⚠️ {i}" for i in issues))
                           if issues else "\n\n<sub>🛡️ Guard check passed (no doses, no definitive diagnosis).</sub>")
@@ -585,6 +595,34 @@ def _timing(res: AgentResult) -> str:
     if res.error:
         return res.error[:160]
     return "cached answer" if res.cache_hit else f"{res.latency_ms / 1000:.1f}s"
+
+
+BLOCKING_GUARD = ("doses", "definitive diagnosis", "changing medication", "Over-reassuring")
+RISK_BADGE = {"CRITICAL": "🔴 CRITICAL", "HIGH": "🟠 HIGH", "MODERATE": "🟡 MODERATE", "LOW": "🟢 LOW"}
+
+
+def patient_assessment_markdown(insight: Dict[str, Any], risk_level: str, draft: str, issues: List[str]) -> str:
+    """What the patient sees straight away: the AI's predicted health picture + plain-language explanation.
+    Clearly labelled as an AI assessment awaiting clinician confirmation; unsafe wording is never shown."""
+    conditions = [str(c) for c in insight.get("possible_conditions") or [] if str(c).strip()][:5]
+    try:
+        conf = float(insight.get("confidence", 0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    md = f"**Overall risk:** {RISK_BADGE.get(risk_level, risk_level)} · **AI confidence:** {conf:.0%}"
+    if conditions:
+        md += ("\n\n**What your reports and symptoms may point to** _(AI prediction — not a diagnosis)_:\n"
+               + "\n".join(f"- {c}" for c in conditions))
+    blocking = [i for i in issues if any(k in i for k in BLOCKING_GUARD)]
+    if blocking:
+        md += ("\n\n_The detailed explanation needs a clinician's check before I can show it (it contained wording "
+               "that must be confirmed by a doctor). Please discuss these findings with your doctor._")
+    elif draft.strip():
+        md += "\n\n---\n" + draft
+        if not any(w in draft.lower() for w in ("doctor", "clinician")):
+            md += "\n\nPlease discuss these results with your doctor."
+    md += "\n\n<sub>🤖 AI assessment from your records — not a diagnosis. A clinician will confirm or correct it.</sub>"
+    return md
 
 
 def _plan_dict(plan: RoutePlan) -> Dict[str, Any]:
