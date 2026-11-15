@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -27,7 +27,8 @@ from clinicalchat.agents import (AgentResult, InsightGenerationAgent, PatientCom
 from clinicalchat.analysis import AnalysisResult, ClinicalAnalysisAgent
 from clinicalchat.audit import Auditor
 from clinicalchat.engine import ClinicalEngine, alert_line
-from clinicalchat.extraction import DataExtractionAgent, ExtractionResult, assess_document, parse_upload
+from clinicalchat.extraction import (MAX_UPLOAD_FILES, DataExtractionAgent, ExtractionResult, assess_document, foreign_name,
+                                     parse_upload)
 from clinicalchat.llm import get_chat_model
 from clinicalchat.models import Domain
 from clinicalchat.rbac import AGENT_LABELS, AgentName, Role, policy
@@ -144,50 +145,111 @@ class Orchestrator:
     # ------------------------------------------------------------------ report upload
     def upload(self, path: Path, session: ChatSession, display_name: Optional[str] = None,
                report_type: str = "auto") -> Iterator[Event]:
+        """Single-file upload (kept for the CLI/tests) — see `upload_many`."""
+        return self.upload_many([(Path(path), display_name or Path(path).name)], session, report_type=report_type)
+
+    def upload_many(self, files: Sequence[Tuple[Path, str]], session: ChatSession, message: str = "",
+                    report_type: str = "auto") -> Iterator[Event]:
+        """Upload one or more reports, optionally with a message ("I have fever — here are my reports, is it serious?").
+        Each file is read, checked and saved on its own; the 5-agent pipeline then runs ONCE over everything that was
+        accepted, answering the message if there is one (same LLM cost as a single report)."""
+        message = (message or "").strip()
         started = time.perf_counter()
         pol = policy(session.role)
         key = session.own_patient if pol.own_record_only else session.selected_patient
-        name = display_name or Path(path).name
-        turn = Turn(question=f"[upload] {name}", role=session.role.value, patient_key=key)
+        names = [n for _, n in files]
+        turn = Turn(question=message or f"[upload] {', '.join(names)}", role=session.role.value, patient_key=key)
         plan = RoutePlan(mode="case", patient_key=key, patient_source="session", check_allergies=True,
                          agents=[a for a in AgentName if a in pol.agents
                                  and (a != AgentName.COMMUNICATION or session.role == Role.PATIENT)])
         run = _Run()
+        label = AGENT_LABELS[AgentName.EXTRACTION]
         if not pol.can_upload or not key:
             turn.blocked = ("Uploading reports is not available for your role." if not pol.can_upload
                             else "Select a patient first, then upload their report.")
             yield Event("blocked", "🔒 Upload", turn.blocked)
             return self._finish(session, turn, plan, run, started)
-        patient = self.engine.patient(key)
-        label = AGENT_LABELS[AgentName.EXTRACTION]
-        yield Event("status", f"{label} — reading {name}", "Extracting text (OCR for scans), sections and lab values…",
-                    "pending", "agent-extraction")
-        try:
-            doc = parse_upload(Path(path), patient_key=key, patient_name=patient.name, report_type=report_type,
-                               uploaded_by=session.username, uploaded_at=_now(), display_name=name,
-                               cache_dir=self.engine.settings.work_dir / "ocr_cache")
-        except Exception as exc:
-            turn.blocked = f"I could not read **{name}**: {exc}"
-            yield Event("status", f"{label} — failed", str(exc)[:200], "done", "agent-extraction")
+        if not files:
+            turn.blocked = "No files were received."
             yield Event("blocked", "📄 Upload", turn.blocked)
             return self._finish(session, turn, plan, run, started)
-        quality = assess_document(doc, patient.name)
-        self.store.save_upload(doc.model_dump_json(), quality.model_dump(), key, doc.doc_id, name, session.username)
-        self.engine.add_document(doc)
-        labs = sum(len(s.lab_results) for s in doc.sections)
-        text = (f"Read **{name}** as a **{doc.category.replace('_', ' ')}** report ({doc.extraction_method}) — "
-                f"{len(doc.sections)} section(s), {labs} lab value(s). Extraction confidence: **{quality.level}** "
-                f"({quality.score:.0%}).")
-        if quality.issues:
-            text += "\n" + "\n".join(f"- ⚠️ {i}" for i in quality.issues[:4])
-        if quality.low_confidence:
-            text += "\n- 🚩 **Low-confidence extraction — flagged for clinician review**"
-        yield Event("step", f"{label} — report saved to the record", text, data={"agent": "extraction"})
-        plan.focus = [doc.domain] if doc.domain not in (Domain.REFERENCE,) else []
-        question = f"Please review my newly uploaded report '{name}'." if session.role == Role.PATIENT else \
-            f"Review the newly uploaded report '{name}' for {patient.name}."
+        if len(files) > MAX_UPLOAD_FILES:
+            turn.blocked = (f"You selected **{len(files)}** files. Please upload at most **{MAX_UPLOAD_FILES}** reports at a "
+                            "time so each one can be checked properly.")
+            yield Event("blocked", "📄 Upload", turn.blocked)
+            return self._finish(session, turn, plan, run, started)
+        if message:
+            # the message decides symptoms / drugs / allergens to check; the record stays the session's patient
+            yield Event("status", "🧭 Understanding your message", "Detecting symptoms, medicines and topic…", "pending", "route")
+            routed = self.router.route(message, session.role, session_patient=key, own_patient=session.own_patient)
+            if routed.blocked or (routed.patient_key and routed.patient_key != key):
+                turn.blocked = routed.blocked or ("Your message is about a different patient than the one these reports are "
+                                                  "being added to. Select that patient first, then attach the reports.")
+                yield Event("status", "🧭 Routed", "Blocked", "done", "route")
+                yield Event("blocked", "🔒 Access", turn.blocked)
+                return self._finish(session, turn, plan, run, started)
+            plan.symptoms, plan.drugs, plan.allergens = routed.symptoms, routed.drugs, routed.allergens
+            plan.notes = routed.notes
+            yield Event("status", "🧭 Routed", self._route_text(plan, session), "done", "route", {"plan": _plan_dict(plan)})
+
+        patient = self.engine.patient(key)
+        accepted: List[Tuple[str, Any]] = []  # (display name, ClinicalDocument)
+        lines: List[str] = []
+        seen: set = set()
+        total = len(files)
+        for i, (path, name) in enumerate(files, 1):
+            prefix = f"({i}/{total}) " if total > 1 else ""
+            yield Event("status", f"{label} — reading {prefix}{name}", "Extracting text (OCR for scans), sections and lab values…",
+                        "pending", "agent-extraction")
+            try:
+                doc = parse_upload(Path(path), patient_key=key, patient_name=patient.name, report_type=report_type,
+                                   uploaded_by=session.username, uploaded_at=_now(), display_name=name,
+                                   cache_dir=self.engine.settings.work_dir / "ocr_cache")
+            except Exception as exc:
+                lines.append(f"- ❌ **{name}** — could not be read: {str(exc)[:160]}")
+                continue
+            if doc.doc_id in seen or doc.doc_id in self.engine.docs_by_id:
+                lines.append(f"- ↩️ **{name}** — already on your record, skipped")
+                continue
+            other = foreign_name(doc, patient.name)
+            if other:
+                lines.append(f"- 🪪 **{name}** — the name on the report is **{other}**, not **{patient.name}**. "
+                             "Not added (ask the lab for a corrected copy, or a clinician can add it).")
+                continue
+            seen.add(doc.doc_id)
+            quality = assess_document(doc, patient.name)
+            self.store.save_upload(doc.model_dump_json(), quality.model_dump(), key, doc.doc_id, name, session.username)
+            self.engine.add_document(doc)
+            accepted.append((name, doc))
+            labs = sum(len(s.lab_results) for s in doc.sections)
+            line = (f"- ✅ **{name}** — {doc.category.replace('_', ' ')} report ({doc.extraction_method}), "
+                    f"{labs} lab value(s), extraction confidence **{quality.level}** ({quality.score:.0%})")
+            line += "".join(f"\n  - ⚠️ {issue}" for issue in quality.issues[:3])
+            if quality.low_confidence:
+                line += "\n  - 🚩 Low-confidence extraction — flagged for clinician review"
+            lines.append(line)
+
+        head = (f"**{len(accepted)} of {total}** report(s) added to the record." if total > 1 else
+                ("Report added to the record." if accepted else "The report was not added."))
+        yield Event("step", f"{label} — reports checked", head + "\n" + "\n".join(lines), data={"agent": "extraction"})
+        if not accepted:
+            turn.blocked = "None of the uploaded files could be added, so there is nothing new to analyse."
+            yield Event("status", f"{label} — nothing added", turn.blocked, "done", "agent-extraction")
+            yield Event("blocked", "📄 Upload", turn.blocked)
+            return self._finish(session, turn, plan, run, started)
+
+        plan.focus = list(dict.fromkeys(d.domain for _, d in accepted if d.domain != Domain.REFERENCE))
+        listed = ", ".join(f"'{n}'" for n, _ in accepted)
+        word = "report" if len(accepted) == 1 else "reports"
+        if message:
+            if session.role == Role.PATIENT and plan.symptoms:
+                self._save_symptoms(key, plan.symptoms)
+            question = f"{message}\n(Attached {word}: {listed})"
+        else:
+            question = (f"Please review my newly uploaded {word} {listed}." if session.role == Role.PATIENT else
+                        f"Review the newly uploaded {word} {listed} for {patient.name}.")
         turn.question = question
-        yield from self._pipeline(question, session, plan, turn, run, upload_doc_id=doc.doc_id)
+        yield from self._pipeline(question, session, plan, turn, run, upload_doc_ids=[d.doc_id for _, d in accepted])
         return self._finish(session, turn, plan, run, started)
 
     # ------------------------------------------------------------------ clinician review
@@ -208,25 +270,25 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ pipeline
     def _pipeline(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
-                  upload_doc_id: Optional[str] = None) -> Iterator[Event]:
+                  upload_doc_ids: Sequence[str] = ()) -> Iterator[Event]:
         e, role = self.engine, session.role
         patient = e.patient(plan.patient_key)
         is_patient = role == Role.PATIENT
 
         # 1) 📄 Data Extraction
         label = AGENT_LABELS[AgentName.EXTRACTION]
-        if not upload_doc_id:
+        if not upload_doc_ids:
             yield Event("status", f"{label} — gathering records", "Selecting the relevant reports and checking quality…",
                         "pending", "agent-extraction")
         ext = self.extraction.run(question, role, plan.patient_key, plan.focus, new_symptoms=plan.symptoms,
-                                  upload_doc_id=upload_doc_id)
+                                  upload_doc_ids=upload_doc_ids)
         run.ext = ext
-        if not upload_doc_id:
+        if not upload_doc_ids:
             summary = self._extraction_text(ext, is_patient)
             yield Event("status", f"{label} — done", summary.split("\n")[0], "done", "agent-extraction")
             yield Event("step", label, summary, data={"agent": "extraction"})
         else:
-            yield Event("status", f"{label} — done", "Upload processed", "done", "agent-extraction")
+            yield Event("status", f"{label} — done", f"{len(upload_doc_ids)} report(s) processed", "done", "agent-extraction")
 
         # 2) 🔬 Clinical Analysis (Lab Interpreter, Radiology Analyzer, Allergy Safety, symptom differential)
         label = AGENT_LABELS[AgentName.ANALYSIS]
@@ -234,7 +296,7 @@ class Orchestrator:
                     "allergies and symptoms…", "pending", "agent-analysis")
         an = self.analysis.run(ext, plan.drugs, plan.allergens, check_allergies=plan.check_allergies)
         run.analysis = an
-        summary = self._analysis_text(an, is_patient)
+        summary = self._analysis_text(an, is_patient, patient.medications if patient else ())
         yield Event("status", f"{label} — done", summary.split("\n")[0], "done", "agent-analysis")
         yield Event("step", label, summary, data={"agent": "analysis"})
         safety_md = self.safety_banner(plan)
@@ -255,8 +317,12 @@ class Orchestrator:
         yield Event("status", f"{label} — {risk.risk_level}", summary.split("\n")[0], "done", "agent-risk")
         yield Event("step", label, summary, data={"agent": "risk", "level": risk.risk_level})
         guidance = risk.clinical_level
-        if is_patient and (ext.new_symptoms or upload_doc_id or guidance != "LOW"):
-            yield Event("guidance", "What to do now", PATIENT_GUIDANCE[guidance], data={"level": guidance})
+        if is_patient and (ext.new_symptoms or upload_doc_ids or guidance != "LOW"):
+            text = PATIENT_GUIDANCE[guidance]
+            if guidance == "LOW" and ext.quality.low_confidence:
+                text = ("🔍 **I couldn't read enough from this report to judge it**, so I can't say whether it is normal. "
+                        "A clinician will check it. If you feel unwell, don't wait — see a doctor.")
+            yield Event("guidance", "What to do now", text, data={"level": guidance})
 
         # 4) 💡 Insight Generation (LLM)
         config = self._config(session)
@@ -426,7 +492,7 @@ class Orchestrator:
         return "\n".join(lines)
 
     @staticmethod
-    def _analysis_text(an: AnalysisResult, is_patient: bool) -> str:
+    def _analysis_text(an: AnalysisResult, is_patient: bool, medications: Sequence[str] = ()) -> str:
         out = []
         if an.lab_results:
             line = f"**Lab Interpreter:** {len(an.lab_results)} values checked, {len(an.abnormal)} outside the normal range"
@@ -449,6 +515,10 @@ class Orchestrator:
         if an.differential:
             prefix = "**Symptoms may fit (not a diagnosis):** " if is_patient else "**Symptom differential (KG):** "
             out.append(prefix + ", ".join(str(d["condition"]) for d in an.differential[:4]))
+        if an.documented_conditions:
+            out.append("**Record review:** documented conditions — " + ", ".join(an.documented_conditions[:5]))
+        if medications:
+            out.append("**Record review:** medicines on record — " + "; ".join(m.split(" - ")[0] for m in medications[:4]))
         out += [f"⚠️ **Clinical inconsistency:** {i}" for i in an.inconsistencies[:2]]
         return "\n".join(f"- {o}" for o in out) if out else "- Nothing to analyse yet (no reports or symptoms)"
 

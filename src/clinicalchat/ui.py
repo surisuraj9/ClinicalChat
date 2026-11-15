@@ -16,7 +16,7 @@ from clinicalchat.export import export_session
 from clinicalchat.llm import describe_llm
 from clinicalchat.orchestrator import ChatSession, Event, Orchestrator
 from clinicalchat.personas import PERSONAS, Persona, get_persona
-from clinicalchat.extraction import SUPPORTED_UPLOADS
+from clinicalchat.extraction import MAX_UPLOAD_FILES, SUPPORTED_UPLOADS
 from clinicalchat.rbac import AGENT_LABELS, AGENT_ORDER, AgentName, Role, policy
 from clinicalchat.store import get_store
 
@@ -135,6 +135,8 @@ button.cc-chip:hover {background:#eef2ff !important; border-color:#c7d2fe !impor
 .cc-input {gap:8px !important;}
 .cc-input button, .cc-input .cc-up button {height:42px !important; white-space:nowrap !important; width:116px !important; min-width:116px !important;
   flex:0 0 116px !important; font-size:14px !important; font-weight:600 !important; padding:0 10px !important; border-radius:10px !important;}
+.cc-input button.cc-attach {width:70px !important; min-width:70px !important; flex:0 0 70px !important;
+  background:#eef2ff !important; border:1px solid #c7d2fe !important; color:#3730a3 !important; box-shadow:none !important;}
 .cc-input button.cc-sec {background:#f8fafc !important; border:1px solid #e2e8f0 !important; color:#1f2937 !important; box-shadow:none !important;}
 footer {display:none !important;}
 @media (max-width: 900px) {.cc-main {flex-wrap:wrap !important;} .cc-side {height:auto;} .cc-agents {grid-template-columns:repeat(2, 1fr);}}
@@ -207,7 +209,7 @@ def patient_card(session: Optional[ChatSession]) -> str:
     meta = ", ".join(x for x in [f"{p.age} yrs" if p.age is not None else "", p.gender or ""] if x)
     tags = "".join(f"<span class='cc-tag'>{d.value.replace('_', ' ')}</span>" for d in engine.patient_domains(p.patient_key))
     if not tags:
-        tags = "<span class='cc-muted'>No reports on file yet" + (" — use 📎 Upload" if policy(session.role).can_upload else "") + "</span>"
+        tags = "<span class='cc-muted'>No reports on file yet" + (" — use 📎 Attach" if policy(session.role).can_upload else "") + "</span>"
     if p.allergies:
         allergy = "<div class='cc-allergy'>⚠️ <b>Allergies:</b> " + html.escape(
             "; ".join(f"{a.allergen} ({'self-reported' if a.source == SELF_REPORTED else a.severity.lower()})"
@@ -313,7 +315,7 @@ def welcome(persona: Persona) -> List[dict]:
     first = persona.display_name.split()[-1] if persona.role != Role.PATIENT else persona.display_name.split()[0]
     greet = f"Hello {('Dr. ' + first) if persona.display_name.startswith('Dr.') else first} 👋"
     if persona.role == Role.PATIENT:
-        body = ("Tell me how you are feeling (e.g. *“I have fever and cough since 3 days”*), upload a report with **📎 Upload**, "
+        body = ("Tell me how you are feeling (e.g. *“I have fever and cough since 3 days”*), attach up to 10 reports with **📎 Attach** and send them with a message, "
                 "or ask any health question.\n\nFive agents work on your message: **📄 Data Extraction** reads your records, "
                 "**🔬 Clinical Analysis** checks values, scans, allergies and symptoms, **🚨 Risk Detection** tells you right "
                 "away if you need urgent care, **💡 Insight Generation** prepares a summary for your clinician and "
@@ -434,16 +436,68 @@ def respond(message: str, history: List[dict], session: Optional[ChatSession]):
     yield h, "", gr.update(interactive=True), strip
 
 
-def respond_upload(file, history: List[dict], session: Optional[ChatSession]):
-    history = list(history or [])
-    if session is None or not file:
-        yield history, gr.update(), gr.update()
+def _upload_paths(files) -> List[Path]:
+    if not files:
+        return []
+    items = files if isinstance(files, (list, tuple)) else [files]
+    out = []
+    for f in items:
+        name = f if isinstance(f, str) else getattr(f, "path", None) or getattr(f, "name", "")
+        if name:
+            out.append(Path(name))
+    return out
+
+
+DEFAULT_PLACEHOLDER = "Type a message and press Enter · 📎 Attach to add reports"
+
+
+def attach_label(paths: List[str]) -> dict:
+    if not paths:
+        return gr.update(visible=False, value="")
+    return gr.update(visible=True, value=f"📎 {len(paths)} ✕")
+
+
+def attach_placeholder(paths: List[str]) -> dict:
+    if not paths:
+        return gr.update(placeholder=DEFAULT_PLACEHOLDER)
+    names = ", ".join(Path(p).name for p in paths)
+    return gr.update(placeholder=f"Attached: {names} — add a message (optional) and press Send")
+
+
+def attach_files(files, attached: List[str], session: Optional[ChatSession]):
+    """📎 only attaches; nothing is analysed until the user presses Send (with or without a message)."""
+    current = list(attached or [])
+    names = {Path(p).name for p in current}
+    for p in _upload_paths(files):
+        if p.name not in names and len(current) < MAX_UPLOAD_FILES:
+            current.append(str(p))
+            names.add(p.name)
+    return current, attach_label(current), attach_placeholder(current)
+
+
+def clear_attachments():
+    return [], attach_label([]), attach_placeholder([])
+
+
+def respond_with_files(message: str, history: List[dict], session: Optional[ChatSession], attached: List[str]):
+    """Send button / Enter: the message plus any attached reports go through ONE pipeline run."""
+    paths = [Path(p) for p in (attached or [])]
+    message = (message or "").strip()
+    if not paths:
+        for h, m, s, strip in respond(message, history, session):
+            yield h, m, s, strip, gr.update(), gr.update(), gr.update()
         return
-    path = Path(file if isinstance(file, str) else getattr(file, "name", ""))
-    for h, strip in _stream(get_orchestrator().upload(path, session, display_name=path.name), f"📎 Uploaded **{path.name}**",
-                            history, session):
-        yield h, gr.update(interactive=not session.busy), strip
-    yield h, gr.update(interactive=True), strip
+    history = list(history or [])
+    if session is None:
+        yield history, "", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+        return
+    files_md = "\n".join(f"- 📎 {p.name}" for p in paths)
+    label = f"{message}\n\n{files_md}" if message else f"📎 **{len(paths)} report(s) attached**\n{files_md}"
+    events = get_orchestrator().upload_many([(p, p.name) for p in paths], session, message=message)
+    cleared = clear_attachments()
+    for h, strip in _stream(events, label, history, session):
+        yield (h, "", gr.update(interactive=not session.busy), strip, *cleared)
+    yield (h, "", gr.update(interactive=True), strip, *cleared)
 
 
 def deliver_updates(session: Optional[ChatSession], history: List[dict]) -> Optional[List[dict]]:
@@ -515,12 +569,14 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
                 strip = gr.HTML(agent_strip(None), padding=False)
                 chatbot = gr.Chatbot(elem_id="cc-chat", height="calc(100vh - 274px)", show_label=False, render_markdown=True,
                                      group_consecutive_messages=False,
-                                     placeholder="Describe your symptoms, upload a report or ask a health question…")
+                                     placeholder="Describe your symptoms, attach reports or ask a health question…")
+                attached = gr.State([])
                 with gr.Row(elem_classes="cc-input"):
-                    msg = gr.Textbox(placeholder="Type your question and press Enter…", show_label=False, scale=8,
+                    msg = gr.Textbox(placeholder=DEFAULT_PLACEHOLDER, show_label=False, scale=8,
                                      autofocus=True, container=False)
+                    attach_chip = gr.Button("", scale=0, min_width=70, elem_classes="cc-attach", visible=False)
                     send = gr.Button("Send ➤", variant="primary", scale=0, min_width=116)
-                    upload_btn = gr.UploadButton("📎 Upload", file_types=list(SUPPORTED_UPLOADS), file_count="single",
+                    upload_btn = gr.UploadButton("📎 Attach", file_types=list(SUPPORTED_UPLOADS), file_count="multiple",
                                                  scale=0, min_width=116, elem_classes="cc-sec", visible=False)
                     export_btn = gr.DownloadButton("⬇️ Export", value=None, interactive=False, scale=0, min_width=116,
                                                    elem_classes="cc-sec")
@@ -587,12 +643,14 @@ def build_ui(auth_enabled: bool = True) -> gr.Blocks:
 
         post = [export_btn, patient_pick, card, cases_box, rev_title, review_pick]
         outputs = [chatbot, msg, send, strip]
-        msg.submit(respond, [msg, chatbot, session], outputs, concurrency_limit=4).then(after_turn, session, post)
-        send.click(respond, [msg, chatbot, session], outputs, concurrency_limit=4).then(after_turn, session, post)
+        send_outputs = [*outputs, attached, attach_chip, msg]
+        send_inputs = [msg, chatbot, session, attached]
+        msg.submit(respond_with_files, send_inputs, send_outputs, concurrency_limit=4).then(after_turn, session, post)
+        send.click(respond_with_files, send_inputs, send_outputs, concurrency_limit=4).then(after_turn, session, post)
         for chip in chips:
             chip.click(respond, [chip, chatbot, session], outputs, concurrency_limit=4).then(after_turn, session, post)
-        upload_btn.upload(respond_upload, [upload_btn, chatbot, session], [chatbot, send, strip],
-                          concurrency_limit=2).then(after_turn, session, post)
+        upload_btn.upload(attach_files, [upload_btn, attached, session], [attached, attach_chip, msg])
+        attach_chip.click(clear_attachments, None, [attached, attach_chip, msg])
 
         # ---------------- clinician review queue
         def open_case(case_id: Optional[str], history: List[dict], s: Optional[ChatSession]):

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from clinicalchat.engine import ClinicalEngine
 
 CONFIDENCE_THRESHOLD = 0.55
+MAX_UPLOAD_FILES = 10
 SUPPORTED_UPLOADS = [".pdf", ".docx", ".txt", ".md", ".xlsx", ".png", ".jpg", ".jpeg"]
 
 REPORT_TYPES = {
@@ -82,8 +83,11 @@ class ExtractionQuality(BaseModel):
     issues: List[str] = Field(default_factory=list)
 
 
-def classify(text: str, lab_count: int) -> tuple[str, Domain]:
+def classify(text: str, lab_count: int, allergy_panel: bool = False) -> tuple[str, Domain]:
+    """`allergy_panel`: every parsed value is an IgE measurement (allergy test reports are table-shaped too)."""
     lab_hits = len(_LAB_WORDS.findall(text))
+    if allergy_panel and len(_ALLERGY_WORDS.findall(text)) >= 2:
+        return "allergy_upload", Domain.ALLERGY
     if lab_count >= 3 or lab_hits >= 3:
         return "lab", Domain.LAB
     if _RAD_STUDY.search(text) and len(_RAD_WORDS.findall(text)) >= 2:
@@ -105,6 +109,20 @@ def _report_type(doc: Optional[ClinicalDocument]) -> str:
 def printed_name(text: str) -> Optional[str]:
     m = _PRINTED_NAME.search(text)
     return m.group(1).strip() if m else None
+
+
+def names_match(printed: str, expected: str) -> bool:
+    a, b = printed.lower().strip(), expected.lower().strip()
+    return a in b or b in a
+
+
+def foreign_name(doc: ClinicalDocument, expected_name: str) -> Optional[str]:
+    """Name printed on an uploaded report when it clearly belongs to someone else."""
+    for s in doc.sections:
+        printed = printed_name(s.text)
+        if printed and expected_name and not names_match(printed, expected_name):
+            return printed
+    return None
 
 
 def assess_section(section: Section, doc: Optional[ClinicalDocument], expected_name: Optional[str] = None) -> SectionQuality:
@@ -141,7 +159,7 @@ def assess_section(section: Section, doc: Optional[ClinicalDocument], expected_n
         if "finding" not in low and "observation" not in low:
             penalties.append((0.1, "no findings section found"))
     printed = printed_name(section.text)
-    if expected_name and printed and printed.lower() not in expected_name.lower() and expected_name.lower() not in printed.lower():
+    if expected_name and printed and not names_match(printed, expected_name):
         penalties.append((0.5, f"name on report ('{printed}') does not match the patient ('{expected_name}')"))
     q.score = round(max(0.0, 1.0 - sum(p for p, _ in penalties)), 2)
     q.issues = [msg for _, msg in penalties]
@@ -204,7 +222,8 @@ def parse_upload(path: Path, *, patient_key: str, patient_name: str, report_type
     if report_type in REPORT_TYPES:
         category, domain = REPORT_TYPES[report_type]
     else:
-        category, domain = classify(text, sum(len(d.lab_results) for d in drafts))
+        labs = [r for d in drafts for r in d.lab_results]
+        category, domain = classify(text, len(labs), bool(labs) and all("ige" in r.parameter.lower() for r in labs))
     digest = hashlib.sha1(path.read_bytes() + patient_key.encode()).hexdigest()[:10]
     doc_id = f"UPLOAD-{digest}"
     doc = ClinicalDocument(doc_id=doc_id, filename=filename, relative_path=f"uploads/{patient_key}/{filename}",
@@ -256,7 +275,7 @@ class DataExtractionAgent:
         self.engine = engine
 
     def run(self, question: str, role: Role, patient_key: Optional[str], focus: Sequence[Domain],
-            new_symptoms: Sequence[str] = (), upload_doc_id: Optional[str] = None) -> ExtractionResult:
+            new_symptoms: Sequence[str] = (), upload_doc_ids: Sequence[str] = ()) -> ExtractionResult:
         e, pol = self.engine, policy(role)
         res = ExtractionResult(patient_key=patient_key, new_symptoms=list(new_symptoms))
         res.denied = [d for d in focus if d not in pol.domains]
@@ -267,8 +286,8 @@ class DataExtractionAgent:
 
         if patient_key:
             sections = [s for s in e.store.patient_sections(patient_key, wanted)]
-            if upload_doc_id:
-                sections = [s for s in sections if s.doc_id == upload_doc_id] or sections
+            if upload_doc_ids:
+                sections = [s for s in sections if s.doc_id in set(upload_doc_ids)] or sections
             else:
                 sections = self._focus(question, sections)
             res.sections = sections

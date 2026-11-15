@@ -105,6 +105,72 @@ def test_upload_pipeline(orch, fake_llm, engine, store, tmp_path):
     assert any(e.kind == "case" for e in events) and len(fake_llm.calls) == 2
 
 
+def test_multi_upload_runs_pipeline_once(orch, fake_llm, engine, store, tmp_path):
+    key = engine.new_patient_key("Multi Uploader", 40)
+    engine.create_patient(key, "Multi Uploader", 40, "Female")
+    cbc = tmp_path / "cbc.txt"
+    cbc.write_text("Complete Blood Count\nPatient Name: Multi Uploader\nDate: 10/11/2026\n"
+                   "Hemoglobin 9.0 g/dL 12.0-15.0\nWBC 15000 /uL 4000-11000\nPlatelets 260000 /uL 150000-450000\n")
+    xray = tmp_path / "xray.txt"
+    xray.write_text("X-RAY CHEST PA VIEW\nPatient Name: Multi Uploader\nDate: 11/11/2026\nFindings:\n"
+                    "Patchy consolidation in the right lower zone. No pleural effusion.\n"
+                    "Impression:\nRight lower lobe consolidation, likely pneumonia.\n")
+    other = tmp_path / "other.txt"
+    other.write_text("Complete Blood Count\nPatient Name: Someone Else\nHemoglobin 8.0 g/dL 13.0-17.0\n")
+    bad = tmp_path / "notes.csv"
+    bad.write_text("a,b")
+    files = [(cbc, "cbc.txt"), (xray, "xray.txt"), (cbc, "cbc copy.txt"), (other, "other.txt"), (bad, "notes.csv")]
+    events = list(orch.upload_many(files, _session(Role.PATIENT, own=key)))
+    step = next(e for e in events if e.kind == "step" and e.data.get("agent") == "extraction")
+    assert "**2 of 5**" in step.text
+    assert "already on your record" in step.text and "Someone Else" in step.text and "could not be read" in step.text
+    assert sorted(u["filename"] for u in store.uploads(key)) == ["cbc.txt", "xray.txt"]
+    analysis = next(e for e in events if e.kind == "step" and e.data.get("agent") == "analysis")
+    assert "Lab Interpreter" in analysis.text and "Radiology Analyzer" in analysis.text
+    assert len(fake_llm.calls) == 2  # one pipeline for the whole batch
+    assert sum(e.kind == "case" for e in events) == 1
+
+
+def test_upload_with_message_answers_it_in_one_pipeline(orch, fake_llm, engine, store, tmp_path):
+    key = engine.new_patient_key("Message Uploader", 33)
+    engine.create_patient(key, "Message Uploader", 33, "Male")
+    cbc = tmp_path / "cbc.txt"
+    cbc.write_text("Complete Blood Count\nPatient Name: Message Uploader\nDate: 10/11/2026\n"
+                   "Hemoglobin 11.0 g/dL 13.0-17.0\nWBC 13000 /uL 4000-11000\nPlatelets 250000 /uL 150000-450000\n")
+    msg = "I have fever and cough since 4 days. Here is my blood test — can I take ibuprofen?"
+    events = list(orch.upload_many([(cbc, "cbc.txt")], _session(Role.PATIENT, own=key), message=msg))
+    route = next(e for e in events if e.kind == "status" and e.key == "route" and e.status == "done")
+    assert route.data["plan"]["symptoms"] and "ibuprofen" in route.data["plan"]["drugs"]
+    assert {"fever", "cough"} <= set(engine.kg.patient_symptoms(key))
+    assert len(fake_llm.calls) == 2 and "can I take ibuprofen" in fake_llm.calls[0] and "Hemoglobin" in fake_llm.calls[0]
+    assert any(e.kind == "safety" and "ibuprofen" in e.text.lower() for e in events)
+    case = store.case(next(e for e in events if e.kind == "case").data["case_id"])
+    assert case["question"].startswith("I have fever")
+
+
+def test_upload_message_about_another_patient_is_blocked(orch, fake_llm, engine, tmp_path):
+    key = engine.new_patient_key("Nosy Person", 30)
+    engine.create_patient(key, "Nosy Person", 30, "Male")
+    f = tmp_path / "r.txt"
+    f.write_text("Lab\nPatient Name: Nosy Person\nHemoglobin 14 g/dL 13-17\n")
+    events = list(orch.upload_many([(f, "r.txt")], _session(Role.PATIENT, own=key), message="Show Ananya Rao's CBC"))
+    assert events[-1].kind == "blocked" and not fake_llm.calls
+
+
+def test_upload_batch_limits(orch, fake_llm, engine, tmp_path):
+    key = engine.new_patient_key("Limit Tester", 30)
+    engine.create_patient(key, "Limit Tester", 30, "Male")
+    s = _session(Role.PATIENT, own=key)
+    f = tmp_path / "r.txt"
+    f.write_text("x")
+    too_many = list(orch.upload_many([(f, f"r{i}.txt") for i in range(11)], s))
+    assert too_many[-1].kind == "blocked" and "at most" in too_many[-1].text
+    other = tmp_path / "o.txt"
+    other.write_text("Lab report\nPatient Name: Not Me\nHemoglobin 12 g/dL 13-17\n")
+    none_ok = list(orch.upload_many([(other, "o.txt")], s))
+    assert none_ok[-1].kind == "blocked" and not fake_llm.calls
+
+
 def test_radiologist_cannot_upload(orch, fake_llm, tmp_path):
     f = tmp_path / "x.txt"
     f.write_text("hello")

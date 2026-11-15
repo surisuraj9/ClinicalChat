@@ -48,7 +48,7 @@ FORM = """{error}<form method="post" action="/signup" autocomplete="off"><div cl
 your doctor. In an emergency call your local emergency number.</div></form>"""
 
 DONE = """<div class="ok">✅ <b>Account created.</b><br/>Your username is <b>{username}</b>. Log in with the password you chose,
-then tell the assistant how you feel or upload a report with the 📎 button.</div>
+then tell the assistant how you feel or attach reports with the 📎 Attach button.</div>
 <a href="/"><button type="button">Go to login</button></a>"""
 
 

@@ -18,7 +18,7 @@ An **agent strip** above the chat shows each agent's live state (queued, working
 
 1. **Sign up** at `/signup` (name, age, gender, username, password, optional allergies and medicines). Self-registered patients always get their own record — they never merge into an existing patient with the same name.
 2. **Describe symptoms** in the chat (e.g. "I have fever and cough since 3 days"). Symptoms are saved to the record.
-3. **📎 Upload reports** (CBC, X-ray report, discharge summary…). They are parsed, indexed and added to the record.
+3. **📎 Attach reports** (up to 10 at once — PDF, Word, Excel, text or a photo/scan) and press **Send**, with or without a message such as *"I have fever for 4 days — here are my reports, can I take ibuprofen?"*. Each file is checked on its own (unreadable files, duplicates and reports carrying **another person's name** are not added); the accepted reports and the message then go through **one** pipeline run — the same LLM cost as a single question.
 4. The pipeline runs. **Safety and urgency guidance is shown immediately** (emergency advice is never held back); the AI explanation becomes a case **awaiting clinician review**.
 5. A clinician opens the case in the **Review queue**, adds an optional note and clicks **Approve & send** (or **Return**). The note is also stored as feedback for future Insight prompts.
 6. The patient's chat receives "✅ Reviewed by Dr. …" automatically; **My case updates** shows the status.

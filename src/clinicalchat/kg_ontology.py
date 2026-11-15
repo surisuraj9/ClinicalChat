@@ -214,6 +214,7 @@ CONDITION_KEYWORDS = {
     "Gout / hyperuricemia": ["gout", "hyperuricemia", "hyperuricaemia"],
     "Coagulopathy": ["coagulopathy", "prolonged pt", "bleeding disorder"],
     "Thrombocytopenia": ["thrombocytopenia"],
+    "Dengue": ["dengue"],
     "Viral respiratory infection": ["viral fever", "common cold", "influenza", "flu", "upper respiratory infection", "urti"],
     "Gastroenteritis": ["gastroenteritis", "stomach flu", "food poisoning"],
     "Migraine": ["migraine"],

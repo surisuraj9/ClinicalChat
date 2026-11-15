@@ -36,6 +36,10 @@ THRESHOLDS: Dict[str, tuple[str, List[tuple[str, float, str, str]]]] = {
                                    (">=", 126.0, "MODERATE", "diabetes-range fasting glucose")]),
     "TSH": (r"", [(">", 20.0, "HIGH", "overt hypothyroidism"), (">", 10.0, "MODERATE", "hypothyroidism needing treatment")]),
     "Troponin": (r"", [(">", -1.0, "HIGH", "elevated troponin — myocardial injury")]),
+    "CRP": (r"mg/?l$|^$", [(">", 100.0, "HIGH", "very high CRP — possible serious bacterial infection"),
+                           (">", 10.0, "MODERATE", "raised CRP — active infection or inflammation")]),
+    "WBC count": (r"", [(">=", 25000.0, "HIGH", "marked leucocytosis"),
+                        ("<", 2000.0, "HIGH", "marked leucopenia — infection risk")]),
 }
 ULN_RULES = {"ALT": (3.0, "HIGH", "ALT >3x upper limit"), "AST": (3.0, "HIGH", "AST >3x upper limit"),
              "Bilirubin": (3.0, "HIGH", "bilirubin >3x upper limit")}
@@ -111,6 +115,8 @@ def lab_indicators(results: Sequence[tuple[LabResult, str]], age: Optional[int])
             continue
         hit = None
         rule = THRESHOLDS.get(test)
+        if test == "WBC count" and r.value < 200:  # reported in thousands (e.g. 14.8 x10^3/uL); thresholds are per µL
+            rule = None
         if rule and re.search(rule[0], (r.unit or "").strip().lower()):
             for op, thr, level, reason in rule[1]:
                 if test == "Troponin" and r.status not in (LabStatus.HIGH, LabStatus.CRITICAL_HIGH):
