@@ -70,7 +70,8 @@ Any other personal question ("what do my reports mean?", "is it serious?") is ju
 |---|---|
 | Routing, report checks, clinical analysis, risk, safety alerts (no AI) | ~10–70 ms, shown **instantly** as "⚡ Quick check" |
 | Reading attached reports | files are read/OCR'd **in parallel** (up to 4 at a time) |
-| AI answer — OpenAI (`gpt-4.1-mini`, streamed) | first words in ~1 s, finished in ~2–4 s (typical, network-dependent) |
+| AI answer — OpenAI (`gpt-4.1-mini`, streamed) | **measured:** first words 0.9–1.8 s, finished 2.2–3.3 s |
+| Care-team Insight — OpenAI (`gpt-4.1`, background) | ~3 s after the patient's answer; the patient never waits for it |
 | AI answer — Copilot CLI fallback | ~15–60 s per call (process start + large built-in prompt, no streaming) |
 | Repeated / similar general question | instant (FAQ cache, no AI) |
 
@@ -82,7 +83,16 @@ What makes it fast:
 - **Warm start.** The OpenAI connection is opened when the server starts. This does not use tokens.
 - **FAQ cache.** General questions are matched on their key terms (and the patient's allergies).
 
-To use OpenAI, put the key in `.env` (never commit it): `OPENAI_API_KEY=sk-...`, then restart. `LLM_PROVIDER=auto` picks OpenAI automatically.
+To use OpenAI, copy the template and put the keys in **`.env`**, then restart. `LLM_PROVIDER=auto` picks OpenAI automatically:
+
+```bash
+cp .env.example .env && chmod 600 .env   # .env is git-ignored
+# edit .env: OPENAI_API_KEY=sk-...  (optional) LANGFUSE_PUBLIC_KEY=pk-lf-...  LANGFUSE_SECRET_KEY=sk-lf-...
+```
+
+> ⚠️ Never put real keys in `.env.example`. It is committed to git.
+
+With the Langfuse keys set, every AI call is traced to Langfuse (agent name, model, prompt, tokens, latency). The JSONL audit log in `data/audit/` is always on.
 - **Copilot CLI back end:** calls run one at a time; the adapter stops at the first HTTP 429 and a 2-minute circuit breaker blocks further calls.
 
 ## Architecture
