@@ -58,16 +58,46 @@ def test_patient_case_is_held_for_clinician_review(orch, fake_llm, store):
 
 def test_one_open_case_per_patient_is_updated_not_duplicated(orch, fake_llm, store):
     s = _session(Role.PATIENT, own="rahul-mehta-32", username="rahul.mehta")
-    first = next(e for e in orch.run("Explain my thyroid results", s) if e.kind == "case")
-    second = next(e for e in orch.run("Based on my reports what is my current health condition?", s) if e.kind == "case")
+    first = next(e for e in orch.run("Please ask my doctor to review my thyroid results", s) if e.kind == "case")
+    second = next(e for e in orch.run("I have a headache since yesterday", s) if e.kind == "case")  # new symptom
     assert first.data["case_id"] == second.data["case_id"] and second.data["updated"] and "updated" in second.text
     cases = store.cases(patient_key="rahul-mehta-32")
     assert len(cases) == 1 and [h["question"] for h in cases[0]["payload"]["history"]] == [
-        "Explain my thyroid results", "Based on my reports what is my current health condition?"]
+        "Please ask my doctor to review my thyroid results", "I have a headache since yesterday"]
     orch.triage(first.data["case_id"], "Maria Thomas", "Routine", "dr.sharma")
-    orch.review(first.data["case_id"], "Dr. Neha Sharma", approve=True)  # closed -> the next question opens a new case
-    third = next(e for e in orch.run("I have a headache since yesterday", s) if e.kind == "case")
+    orch.review(first.data["case_id"], "Dr. Neha Sharma", approve=True)  # closed -> the next review request opens a new case
+    third = next(e for e in orch.run("Can a doctor check my thyroid results again?", s) if e.kind == "case")
     assert third.data["case_id"] != first.data["case_id"] and not third.data["updated"]
+
+
+def test_simple_doubt_is_answered_without_a_case_and_reuses_the_insight(orch, fake_llm, store):
+    key = "priya-desai-44"  # MODERATE, nothing that escalates
+    s = _session(Role.PATIENT, own=key, username="priya")
+    events = orch.run("What do my reports mean?", s)
+    assert not any(e.kind == "case" for e in events) and store.cases(patient_key=key) == []
+    answer = next(e for e in events if e.kind == "answer")
+    assert "No case was opened" in answer.text and len(fake_llm.calls) == 2  # Insight + Communication
+    events = orch.run("Is that something serious for me?", s)  # nothing new -> Insight reused, 1 AI call
+    assert len(fake_llm.calls) == 3 and "PATIENT COMMUNICATION" in fake_llm.calls[-1]
+    assert any(e.kind == "status" and e.key == "agent-insight" and "reused" in e.title for e in events)
+    assert not any(e.kind == "case" for e in events)
+    case_id = next(e for e in orch.run("I have a headache since yesterday", s) if e.kind == "case").data["case_id"]
+    assert len(fake_llm.calls) == 5  # new symptom = new evidence -> fresh Insight, and a case for the care team
+    answer = next(e for e in orch.run("What do my reports mean?", s) if e.kind == "answer")
+    assert case_id in answer.text and "did not change it" in answer.text and len(store.cases(patient_key=key)) == 1
+
+
+def test_unreviewed_escalating_findings_open_a_case_once(orch, fake_llm, store):
+    key = "amit-verma-46"  # HIGH risk in his records
+    s = _session(Role.PATIENT, own=key, username="amit")
+    case_id = next(e for e in orch.run("What do my reports mean?", s) if e.kind == "case").data["case_id"]
+    if store.case(case_id)["status"] == "AWAITING_RADIOLOGY":
+        orch.radiology_read(case_id, "Dr. Arjun Iyer", "Agree with AI imaging findings", "")
+    orch.triage(case_id, "Maria Thomas", "Soon", "dr.sharma")
+    orch.review(case_id, "Dr. Neha Sharma", approve=True)
+    # same evidence already reviewed -> the next doubt is just answered
+    assert not any(e.kind == "case" for e in orch.run("What do my reports mean?", s))
+    assert len(store.cases(patient_key=key)) == 1
 
 
 def test_duplicate_open_cases_are_consolidated(store):
@@ -244,7 +274,7 @@ def test_patient_text_guard():
 
 def test_imaging_case_goes_radiologist_then_coordinator_then_assigned_clinician(orch, fake_llm, store):
     s = _session(Role.PATIENT, own="meera-nair-47", username="meera")
-    case_id = next(e for e in orch.run("Explain my CT scan report", s) if e.kind == "case").data["case_id"]
+    case_id = next(e for e in orch.run("Please have a doctor review my CT scan report", s) if e.kind == "case").data["case_id"]
     case = store.case(case_id)
     assert case["status"] == "AWAITING_RADIOLOGY" and case["payload"]["imaging"]
     assert "contrast_alerts" in case["payload"] and "radiologist" in next(
@@ -271,7 +301,7 @@ def test_imaging_case_goes_radiologist_then_coordinator_then_assigned_clinician(
 
 def test_critical_radiology_read_raises_risk_and_goes_back_to_triage(orch, fake_llm, store):
     s = _session(Role.PATIENT, own="meera-nair-47", username="meera")
-    case_id = next(e for e in orch.run("Explain my CT scan report", s) if e.kind == "case").data["case_id"]
+    case_id = next(e for e in orch.run("Please have a doctor review my CT scan report", s) if e.kind == "case").data["case_id"]
     case = orch.radiology_read(case_id, "Dr. Arjun Iyer", "Critical finding — urgent", "Acute bleed — needs urgent review")
     assert case["status"] == "AWAITING_TRIAGE" and case["risk_level"] == "CRITICAL"
 
@@ -281,7 +311,7 @@ def test_case_status_question_uses_no_llm(orch, fake_llm, store):
     events = orch.run("Has the doctor reviewed my case?", s)
     answer = next(e for e in events if e.kind == "answer")
     assert fake_llm.calls == [] and "don't have a case yet" in answer.text
-    orch.run("Explain my thyroid results", s)
+    orch.run("Please ask my doctor to review my thyroid results", s)
     n = len(fake_llm.calls)
     answer = next(e for e in orch.run("what is the status of my case?", s) if e.kind == "answer")
     assert len(fake_llm.calls) == n and "care coordinator" in answer.text.lower()
@@ -308,7 +338,7 @@ def test_case_is_filed_and_routed_even_when_the_ai_is_rate_limited(engine, store
     orch = Orchestrator(engine, llm=RateLimited(cache=False, calls=[]), auditor=Auditor(Settings(work_dir=tmp_path)),
                         store=store)
     s = _session(Role.PATIENT, own="meera-nair-47", username="meera")
-    events = orch.run("Explain my CT scan report", s)
+    events = orch.run("Please have a doctor review my CT scan report", s)
     case_ev = next(e for e in events if e.kind == "case")
     answer = next(e for e in events if e.kind == "answer")
     assert "busy" in answer.text and "not a diagnosis" in answer.text and answer.data["case_id"] == case_ev.data["case_id"]

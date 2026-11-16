@@ -488,7 +488,10 @@ def welcome(persona: Persona) -> List[dict]:
                 "or ask any health question.\n\nFive agents work on your message: **📄 Data Extraction** reads your records, "
                 "**🔬 Clinical Analysis** checks values, scans, allergies and symptoms, **🚨 Risk Detection** tells you right "
                 "away if you need urgent care, **💡 Insight Generation** prepares a summary for your clinician and "
-                "**💬 Patient Communication** explains it in plain language right away, with your **case ID** — a clinician then confirms or corrects it.")
+                "**💬 Patient Communication** explains it in plain language right away.\n\n"
+                "📁 A **case** for the care team is opened only when there is something new to review (new reports or "
+                "symptoms), when you ask for a doctor (*“please ask my doctor to review this”*), or when your results "
+                "need urgent attention. Questions about reports the care team already has are simply answered.")
     elif persona.role == Role.CLINICIAN:
         body = ("Pick a patient on the left (or name one in your question). Each question runs the 5-agent pipeline. "
                 "Patient cases **assigned to you by the care coordinator** (with the radiologist's read, when there are "

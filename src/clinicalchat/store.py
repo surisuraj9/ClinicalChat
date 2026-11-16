@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS cases (
 CREATE TABLE IF NOT EXISTS feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT, reviewer TEXT, action TEXT, note TEXT, topic TEXT,
     created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS insights (
+    patient_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, insight TEXT NOT NULL, created TEXT NOT NULL);
 """
 
 USERNAME_RX = re.compile(r"^[a-z][a-z0-9._-]{2,31}$")
@@ -272,6 +274,15 @@ class Store:
 
     def recent_feedback(self, limit: int = 3) -> List[Dict[str, Any]]:
         return self._rows("SELECT * FROM feedback WHERE note != '' ORDER BY id DESC LIMIT ?", (limit,))
+
+    # ------------------------------------------------------------------ latest Insight per patient (reused while evidence is unchanged)
+    def save_insight(self, patient_key: str, fingerprint: str, insight: Dict[str, Any]) -> None:
+        self._exec("INSERT OR REPLACE INTO insights (patient_key, fingerprint, insight, created) VALUES (?,?,?,?)",
+                   (patient_key, fingerprint, json.dumps(insight, default=str), _now()))
+
+    def insight(self, patient_key: str, fingerprint: str) -> Optional[Dict[str, Any]]:
+        rows = self._rows("SELECT insight FROM insights WHERE patient_key=? AND fingerprint=?", (patient_key, fingerprint))
+        return json.loads(rows[0]["insight"]) if rows else None
 
 
 def _event(actor: str, text: str) -> Dict[str, str]:

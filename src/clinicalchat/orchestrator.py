@@ -15,6 +15,7 @@ Patient answers are shown at once as an AI assessment; the case then moves throu
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -97,6 +98,10 @@ class _Run:
     risk: Optional[RiskAssessment] = None
     llm: List[AgentResult] = field(default_factory=list)
     review_reasons: List[str] = field(default_factory=list)
+    new_symptoms: List[str] = field(default_factory=list)
+    file_case: bool = False  # patient: open/update a care-team case (new evidence or an explicit review request)
+    evidence_fp: str = ""  # Insight cache key
+    case_fp: str = ""  # what a case covered (for the escalation safety net)
 
 
 class Orchestrator:
@@ -143,7 +148,7 @@ class Orchestrator:
             yield from self._explain_last(question, session, turn, run)
         else:
             if session.role == Role.PATIENT and plan.symptoms and plan.patient_key:
-                self._save_symptoms(plan.patient_key, plan.symptoms)
+                run.new_symptoms = self._save_symptoms(plan.patient_key, plan.symptoms)
             yield from self._pipeline(question, session, plan, turn, run)
         return self._finish(session, turn, plan, run, started)
 
@@ -404,17 +409,28 @@ class Orchestrator:
         # 4) 💡 Insight Generation (LLM)
         config = self._config(session)
         label = AGENT_LABELS[AgentName.INSIGHT]
-        yield Event("status", f"{label} — writing", "Consolidating the findings (AI)…" if not is_patient else
-                    "Preparing a clinical summary for your clinician (AI)…", "pending", "agent-insight")
         audience = policy(Role.CLINICIAN if is_patient else role).audience
-        ins = self.insight.run(question=question, audience=audience, patient=e.patient_summary(plan.patient_key),
-                               extraction=self._extraction_brief(ext), facts=an.facts_text(), risk=self._risk_brief(risk),
-                               feedback=self._feedback(), context=e.records_context(question, ext.sections, ext.focus),
-                               history=session.history_text(), config=config)
-        run.llm.append(ins)
+        reused = None
+        if is_patient and plan.patient_key:
+            run.evidence_fp = self._evidence_fp(plan.patient_key, risk.risk_level)
+            run.case_fp = self._evidence_fp(plan.patient_key, risk.risk_level, reads=False)
+            run.file_case = self._needs_case(plan, run, upload_doc_ids, risk)
+            if not (upload_doc_ids or run.new_symptoms or plan.drugs or plan.allergens):
+                reused = self.store.insight(plan.patient_key, run.evidence_fp)
+        if reused is not None:
+            ins = AgentResult(agent=AgentName.INSIGHT, label=label, output=reused)
+            yield Event("status", f"{label} — reused", "Nothing new since the last assessment — reusing it (no AI call)",
+                        "done", "agent-insight")
+        else:
+            yield Event("status", f"{label} — writing", "Consolidating the findings (AI)…" if not is_patient else
+                        "Summarising your records and findings (AI)…", "pending", "agent-insight")
+            ins = self._run_insight(question, audience, plan, ext, an, risk, session, config, run)
+            if is_patient and plan.patient_key and not ins.error and ins.parsed:
+                self.store.save_insight(plan.patient_key, run.evidence_fp, ins.output or {})
         out = ins.output or {}
         run.review_reasons = self._review_reasons(ext, an, risk, ins)
-        yield Event("status", f"{label} — {'failed' if ins.error else 'done'}", _timing(ins), "done", "agent-insight")
+        if reused is None:
+            yield Event("status", f"{label} — {'failed' if ins.error else 'done'}", _timing(ins), "done", "agent-insight")
         session.last_insight = {"patient_key": plan.patient_key, "question": question, "output": out,
                                 "risk": risk.risk_level, "facts": an.facts_text()}
         if not is_patient:
@@ -434,6 +450,14 @@ class Orchestrator:
                             data={"agent": "communication"})
             return
         yield from self._communicate(question, session, plan, turn, run, out, risk.clinical_level, bool(an.abnormal or risk.escalate))
+
+    def _run_insight(self, question, audience, plan, ext, an, risk, session, config, run) -> AgentResult:
+        ins = self.insight.run(question=question, audience=audience, patient=self.engine.patient_summary(plan.patient_key),
+                               extraction=self._extraction_brief(ext), facts=an.facts_text(), risk=self._risk_brief(risk),
+                               feedback=self._feedback(), context=self.engine.records_context(question, ext.sections, ext.focus),
+                               history=session.history_text(), config=config)
+        run.llm.append(ins)
+        return ins
 
     def _communicate(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
                      insight: Dict[str, Any], risk_level: str, abnormal: bool) -> Iterator[Event]:
@@ -455,9 +479,12 @@ class Orchestrator:
         issues = check_patient_text([draft], abnormal)
         if is_patient and plan.patient_key:
             level = run.risk.risk_level if run.risk else risk_level
-            md = patient_assessment_markdown(insight, level, draft, issues)
+            md = patient_assessment_markdown(insight, level, draft, issues, reviewed=run.file_case)
             turn.answers.append({"label": label, "markdown": md, "summary": str((com.output or {}).get("message", ""))[:300]})
-            yield from self._file_case(question, session, plan, turn, run, insight, level, draft, issues, md)
+            if run.file_case:
+                yield from self._file_case(question, session, plan, turn, run, insight, level, draft, issues, md)
+            else:
+                yield from self._answer_doubt(plan, md)
         else:
             md = draft + (("\n\n**🛡️ Guard check before sending:**\n" + "\n".join(f"- ⚠️ {i}" for i in issues))
                           if issues else "\n\n<sub>🛡️ Guard check passed (no doses, no definitive diagnosis).</sub>")
@@ -473,7 +500,7 @@ class Orchestrator:
                                "risk": run.risk.model_dump() if run.risk else {}, "review_reasons": run.review_reasons,
                                "guard_issues": issues, "sources": run.ext.sources if run.ext else [],
                                "possible_conditions": insight.get("possible_conditions", []),
-                               **self._care_team_payload(plan.patient_key, run)},
+                               "evidence_fp": run.case_fp, **self._care_team_payload(plan.patient_key, run)},
                       patient_draft=draft)
         existing = self.store.open_case(plan.patient_key)
         unread = wf.unread_imaging(fields["payload"]["imaging"], self.store.read_imaging_docs(plan.patient_key))
@@ -498,6 +525,16 @@ class Orchestrator:
                        "status of my case?”* any time. The guidance above applies right now.")
         yield Event("case", "📁 Your case with the care team", case_text,
                     data={"case_id": case_id, "updated": bool(existing), "status": status})
+
+    def _answer_doubt(self, plan: RoutePlan, md: str) -> Iterator[Event]:
+        """A question about records the care team already has: answer it, no case opened or changed."""
+        open_ = self.store.open_case(plan.patient_key)
+        if open_:
+            tri = open_["payload"].get("triage") or {}
+            md += (f"\n\n📁 Your case **{open_['case_id']}** is still with the care team "
+                   f"({wf.STAGE_LABEL[open_['status']][0]}{' · ' + tri['clinician_name'] if tri.get('clinician_name') else ''})"
+                   " — this question did not change it.")
+        yield Event("answer", "🩺 Your health picture — AI answer", md, data={"agent": "communication", "case_id": ""})
 
     def _file_case_without_ai(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
                               error: str, insight: Optional[Dict[str, Any]] = None) -> Iterator[Event]:
@@ -524,6 +561,12 @@ class Orchestrator:
         risk_line = f"**Overall risk:** {RISK_BADGE.get(level, level)}"
         draft = risk_line + body + "\n\nPlease discuss these results with your clinician."
         md = risk_line + " · _rule-based check (AI busy)_" + body
+        if not run.file_case:
+            md += ("\n\n_The AI assistant is busy right now, so this is the automatic check only. Ask again in a few "
+                   "minutes for a full explanation._\n\n<sub>🤖 Automatic rule-based check — not a diagnosis.</sub>")
+            turn.answers.append({"label": AGENT_LABELS[AgentName.COMMUNICATION], "markdown": md, "summary": reason})
+            yield from self._answer_doubt(plan, md)
+            return
         md += ("\n\n_The AI assistant is busy right now, so I couldn't write a full explanation. Your reports have still "
                "been sent to the care team, who will review them. Ask again in a few minutes for the full explanation — "
                "it will update this same case._")
@@ -578,12 +621,36 @@ class Orchestrator:
         return {"imaging": imaging, "allergies": run.analysis.allergies if run.analysis else [],
                 "contrast_alerts": contrast, "report_types": sorted(d.value for d in domains if d)}
 
-    def _save_symptoms(self, key: str, symptoms: List[str]) -> None:
+    def _save_symptoms(self, key: str, symptoms: List[str]) -> List[str]:
         known = set(self.engine.kg.patient_symptoms(key))
-        for s in symptoms:
-            if s not in known:
-                self.store.add_fact(key, "symptom", s)
-                self.engine.apply_fact(key, "symptom", s)
+        new = [s for s in dict.fromkeys(symptoms) if s not in known]
+        for s in new:
+            self.store.add_fact(key, "symptom", s)
+            self.engine.apply_fact(key, "symptom", s)
+        return new
+
+    def _evidence_fp(self, key: str, risk_level: str, reads: bool = True) -> str:
+        """Fingerprint of the patient's evidence (reports, facts, risk; + radiologist reads for the Insight cache).
+        Unchanged fingerprint = nothing new for the Insight agent / nothing the care team hasn't already seen."""
+        basis = {"uploads": sorted(u["doc_id"] for u in self.store.uploads(key)),
+                 "facts": sorted(f"{f['kind']}:{f['value']}" for f in self.store.facts(key)), "risk": risk_level}
+        if reads:
+            basis["reads"] = sorted(self.store.read_imaging_docs(key))
+        return hashlib.sha1(json.dumps(basis, sort_keys=True).encode()).hexdigest()[:16]
+
+    def _needs_case(self, plan: RoutePlan, run: _Run, upload_doc_ids: Sequence[str], risk: RiskAssessment) -> bool:
+        """A case is for the care team: only when there is something new to review, the patient asks for a doctor,
+        the clinician is waiting for the patient's reply, or escalating findings were never put in front of a
+        clinician. Simple doubts about records the care team already has are just answered."""
+        if upload_doc_ids or run.new_symptoms or plan.wants_review:
+            return True
+        open_ = self.store.open_case(plan.patient_key)
+        if open_:
+            return open_["status"] == wf.RETURNED
+        if risk.escalate:  # safety net: escalating findings that no case has covered yet
+            return not any(c["payload"].get("evidence_fp") == run.case_fp
+                           for c in self.store.cases(patient_key=plan.patient_key))
+        return False
 
     def _feedback(self) -> str:
         notes = self.store.recent_feedback(3)
@@ -741,7 +808,8 @@ BLOCKING_GUARD = ("doses", "definitive diagnosis", "changing medication", "Over-
 RISK_BADGE = {"CRITICAL": "🔴 CRITICAL", "HIGH": "🟠 HIGH", "MODERATE": "🟡 MODERATE", "LOW": "🟢 LOW"}
 
 
-def patient_assessment_markdown(insight: Dict[str, Any], risk_level: str, draft: str, issues: List[str]) -> str:
+def patient_assessment_markdown(insight: Dict[str, Any], risk_level: str, draft: str, issues: List[str],
+                                reviewed: bool = True) -> str:
     """What the patient sees straight away: the AI's predicted health picture + plain-language explanation.
     Clearly labelled as an AI assessment awaiting clinician confirmation; unsafe wording is never shown."""
     conditions = [str(c) for c in insight.get("possible_conditions") or [] if str(c).strip()][:5]
@@ -761,7 +829,11 @@ def patient_assessment_markdown(insight: Dict[str, Any], risk_level: str, draft:
         md += "\n\n---\n" + draft
         if not any(w in draft.lower() for w in ("doctor", "clinician")):
             md += "\n\nPlease discuss these results with your doctor."
-    md += "\n\n<sub>🤖 AI assessment from your records — not a diagnosis. A clinician will confirm or correct it.</sub>"
+    if reviewed:
+        md += "\n\n<sub>🤖 AI assessment from your records — not a diagnosis. A clinician will confirm or correct it.</sub>"
+    else:
+        md += ("\n\n<sub>🤖 AI answer from your records — not a diagnosis. No case was opened for this question; to have a "
+               "doctor check it, say *“please ask my doctor to review this”*.</sub>")
     return md
 
 

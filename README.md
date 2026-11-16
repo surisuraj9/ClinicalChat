@@ -47,10 +47,20 @@ Routing rules:
 - **AI busy or rate-limited?** The case is still created and routed. It uses the rule-based findings (risk, abnormal values, imaging flags), so reports always reach the care team. The patient gets the AI explanation by asking again, and that updates the same case.
 - Each stage is checked server-side (a clinician cannot confirm an un-triaged case, the coordinator cannot triage before the radiology read, and only clinicians can be assigned). Every step is written to the case timeline and the audit log.
 
+### When is a case opened? (patients)
+
+A case is work for the care team, so simple doubts don't create one. A patient question opens or updates the single open case only when:
+- new reports are attached or new symptoms are mentioned;
+- the patient asks for a doctor ("please ask my doctor to review this");
+- the clinician returned the case and is waiting for the patient's reply; or
+- (**safety net**) the records escalate (HIGH/CRITICAL) and no case has covered this evidence yet.
+
+Any other personal question ("what do my reports mean?", "is it serious?") is just answered. If there is an open case, the answer says so and the case is not changed.
+
 ### LLM budget (important with rate-limited back ends)
 
 - Routing, extraction, clinical analysis and risk detection use **no LLM calls**.
-- Staff question = **1 call** (Insight). Patient case = **2 calls** (Insight + Communication). General question or "explain this to the patient" = **1 call**.
+- Staff question = **1 call** (Insight). Patient question with new evidence = **2 calls** (Insight + Communication). Patient follow-up with **nothing new** = **1 call**: the last Insight for that patient is reused while their reports, symptoms/allergies, radiologist reads and risk level are unchanged. General question or "explain this to the patient" = **1 call**.
 - Responses are cached in SQLite, so asking the same question again is instant and free.
 - **Copilot CLI back end:** calls run one at a time; the adapter stops at the first HTTP 429 and a 2-minute circuit breaker blocks further calls.
 

@@ -32,6 +32,11 @@ CASE_STATUS_ASK = re.compile(
     r"\b(status|progress|stage|update[sd]?|where)\b[^.?!]{0,40}\bcase\b|\bcase\b[^.?!]{0,30}\b(status|progress|stage|now)\b|"
     r"\b(has|have|did)\b[^.?!]{0,25}\b(doctor|clinician|radiologist|coordinator|care team)\b[^.?!]{0,30}"
     r"\b(see|seen|review|reviewed|read|check|checked|look|looked|confirm|confirmed)\b|what happened (to|with) my case", re.I)
+REVIEW_ASK = re.compile(
+    r"\b(doctor|clinician|physician|care team|specialist)\b[^.?!]{0,30}\b(review|check|look at|see|confirm|verify)\b|"
+    r"\b(review|check|look at|confirm|verify)\b[^.?!]{0,30}\bby (a|my|the) (doctor|clinician|physician)\b|"
+    r"\b(open|create|raise|start|file) (a )?case\b|\b(talk|speak|consult) (to|with) (a|my|the) (doctor|clinician)\b|"
+    r"\b(send|forward|share) (it|this|them|my reports?) to (a|my|the) (doctor|clinician|care team)\b", re.I)
 SAFETY_ASK = re.compile(r"safe|take|give|prescrib|avoid|react|allerg|can (i|he|she|they)", re.I)
 
 
@@ -47,6 +52,7 @@ class RoutePlan:
     allergens: List[str] = field(default_factory=list)
     symptoms: List[str] = field(default_factory=list)
     check_allergies: bool = False
+    wants_review: bool = False  # patient explicitly asked for a doctor to look at it -> open a case
     blocked: str = ""
     notes: List[str] = field(default_factory=list)
 
@@ -95,7 +101,9 @@ class Router:
         plan.symptoms = kg.symptoms_in_text(question)
 
         # ---- "where is my case?" — answered from the case workflow, no agents / LLM
-        if plan.patient_key and CASE_STATUS_ASK.search(question) and not (plan.symptoms or plan.drugs or plan.allergens):
+        plan.wants_review = role == Role.PATIENT and bool(REVIEW_ASK.search(question))
+        if (plan.patient_key and CASE_STATUS_ASK.search(question) and not plan.wants_review
+                and not (plan.symptoms or plan.drugs or plan.allergens)):
             plan.mode = "status"
             plan.notes.append("Case-status question — answered from the care-team workflow (no AI call)")
             return plan
@@ -117,7 +125,7 @@ class Router:
         # ---- mode
         personal = bool(PERSONAL.search(question))
         if role == Role.PATIENT:
-            plan.mode = "case" if (personal or plan.symptoms) else "general"
+            plan.mode = "case" if (personal or plan.symptoms or plan.wants_review) else "general"
         elif EXPLAIN.search(question) and AgentName.COMMUNICATION in pol.agents:
             plan.mode = "explain"
         else:
