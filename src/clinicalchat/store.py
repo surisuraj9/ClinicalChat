@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS cases (
 CREATE TABLE IF NOT EXISTS feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT, reviewer TEXT, action TEXT, note TEXT, topic TEXT,
     created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS faq_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, terms TEXT NOT NULL, allergies TEXT NOT NULL, question TEXT NOT NULL,
+    answer TEXT NOT NULL, hits INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS insights (
     patient_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, insight TEXT NOT NULL, created TEXT NOT NULL);
 """
@@ -176,6 +179,36 @@ class Store:
             self._exec("UPDATE cases SET payload=?, status=? WHERE case_id=?",
                        (json.dumps(payload, default=str), status, case_id))
 
+    def _patch_payload(self, case_id: str, patch) -> None:
+        """Read-modify-write of one case's payload in a single locked transaction (safe against concurrent
+        workflow updates, e.g. the background Insight finishing while the coordinator triages)."""
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT payload FROM cases WHERE case_id=?", (case_id,)).fetchone()
+            if row is None:
+                return
+            payload = json.loads(row["payload"])
+            patch(payload)
+            c.execute("UPDATE cases SET payload=? WHERE case_id=?", (json.dumps(payload, default=str), case_id))
+
+    def mark_insight_pending(self, case_id: str) -> None:
+        self._patch_payload(case_id, lambda p: p.update(insight_pending=True, insight_error=""))
+
+    def set_case_insight(self, case_id: str, insight: Optional[Dict[str, Any]], error: str = "") -> None:
+        """The background Insight agent finished: attach its clinical summary to the case (or record the failure)."""
+        def patch(p: Dict[str, Any]) -> None:
+            p["insight_pending"] = False
+            if insight is None:
+                p["insight_error"] = error[:300]
+                return
+            p["insight"], p["insight_error"] = insight, ""
+            if insight.get("possible_conditions"):
+                p["possible_conditions"] = insight["possible_conditions"]
+            conf = insight.get("confidence")
+            if isinstance(conf, (int, float)) and conf < 0.6 and not any("Low confidence" in r for r in p.get("review_reasons", [])):
+                p.setdefault("review_reasons", []).append(f"Low confidence ({conf:.0%})")
+            p.setdefault("timeline", []).append(_event("System", "💡 AI clinical summary added for the care team"))
+        self._patch_payload(case_id, patch)
+
     def radiology_read(self, case_id: str, *, reader: str, verdict: str, report: str, doc_ids: List[str]) -> Dict[str, Any]:
         case = self.case(case_id)
         if not case or case["status"] != wf.RADIOLOGY:
@@ -283,6 +316,50 @@ class Store:
     def insight(self, patient_key: str, fingerprint: str) -> Optional[Dict[str, Any]]:
         rows = self._rows("SELECT insight FROM insights WHERE patient_key=? AND fingerprint=?", (patient_key, fingerprint))
         return json.loads(rows[0]["insight"]) if rows else None
+
+    # ------------------------------------------------------------------ answer cache for general (non-personal) questions
+    def faq_lookup(self, question: str, allergies: str, max_age_days: int = 7) -> Optional[Dict[str, Any]]:
+        """Same or similarly worded general question (same documented allergies) answered recently -> reuse."""
+        terms = faq_terms(question)
+        if not terms:
+            return None
+        rows = self._rows("SELECT * FROM faq_cache WHERE allergies=? AND created >= datetime('now', ?) ORDER BY id DESC "
+                          "LIMIT 500", (allergies, f"-{max_age_days} days"))
+        best, best_score = None, 0.0
+        for r in rows:
+            other = set(r["terms"].split())
+            score = len(terms & other) / len(terms | other)
+            if score > best_score:
+                best, best_score = r, score
+        if best and (best_score == 1.0 or (best_score >= 0.75 and len(terms) >= 3)):
+            self._exec("UPDATE faq_cache SET hits=hits+1 WHERE id=?", (best["id"],))
+            return best
+        return None
+
+    def faq_save(self, question: str, allergies: str, answer: str) -> None:
+        terms = faq_terms(question)
+        if terms:
+            self._exec("INSERT INTO faq_cache (terms, allergies, question, answer, created) VALUES (?,?,?,?,datetime('now'))",
+                       (" ".join(sorted(terms)), allergies, question, answer))
+
+
+_FAQ_STOP = set("""a an the is are was were be been am do does did what whats what's which who how why when where can could
+should would will shall may might must i me my we you your it its this that these those of in on for to from by with about
+and or as at if than then so please tell explain mean means meaning define definition know want need help some any much
+many there their they them he she his her our us normal""".split())
+
+
+def faq_terms(question: str) -> set:
+    """Content words of a question, lightly normalised ("What's HbA1c?" == "what is hba1c" == "HbA1c meaning")."""
+    words = [w for w in re.findall(r"[a-z0-9]+", question.lower().replace("'s", "")) if w not in _FAQ_STOP]
+    return {_us_spelling(w[:-1] if len(w) > 4 and w.endswith("s") and not w.endswith(("ss", "us")) else w) for w in words}
+
+
+def _us_spelling(word: str) -> str:
+    """haemoglobin/hemoglobin, anaemia/anemia, oedema/edema, tumour/tumor, -isation/-ization -> one key."""
+    word = re.sub(r"isation$", "ization", word)
+    word = re.sub(r"(?<=[a-z])our$", "or", word) if len(word) > 5 else word
+    return word.replace("ae", "e").replace("oe", "e")
 
 
 def _event(actor: str, text: str) -> Dict[str, str]:

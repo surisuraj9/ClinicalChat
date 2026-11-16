@@ -34,14 +34,22 @@ def test_patient_case_is_held_for_clinician_review(orch, fake_llm, store):
     s = _session(Role.PATIENT, own="ananya-rao-54", username="ananya.rao")
     events = orch.run("Explain my CBC report", s)
     assert _agent_order(events) == ["extraction", "analysis", "risk", "insight", "communication"]
-    assert len(fake_llm.calls) == 2 and "PATIENT COMMUNICATION" in fake_llm.calls[1]
+    # the patient waits for ONE AI call; the clinician's Insight is written in the background once the case exists
+    assert len(fake_llm.calls) == 1 and "PATIENT COMMUNICATION" in fake_llm.calls[0]
+    assert "Hemoglobin" in fake_llm.calls[0]  # written from the deterministic findings
     answer = next(e for e in events if e.kind == "answer")  # AI assessment shown straight away, with the case id
-    assert "Anaemia" in answer.text and "not a diagnosis" in answer.text and "COMMUNICATION answer" in answer.text
+    assert "may point to** _(automatic checks" in answer.text and "not a diagnosis" in answer.text
+    assert "COMMUNICATION answer" in answer.text
     case_ev = next(e for e in events if e.kind == "case")
     assert answer.data["case_id"] == case_ev.data["case_id"] and case_ev.data["case_id"] in case_ev.text
     case = store.case(case_ev.data["case_id"])
     # no imaging -> straight to the care coordinator (not the radiologist)
     assert case["status"] == "AWAITING_TRIAGE" and "COMMUNICATION answer" in case["patient_draft"]
+    orch.drain()
+    assert len(fake_llm.calls) == 2 and "INSIGHT GENERATION" in fake_llm.calls[1]
+    case = store.case(case["case_id"])
+    assert case["payload"]["insight"]["answer"] and not case["payload"]["insight_pending"]
+    assert "AI clinical summary added" in case["payload"]["timeline"][-1]["event"]
     assert store.undelivered("ananya-rao-54") == []
     with pytest.raises(ValueError):  # a clinician cannot confirm a case before it has been triaged
         orch.review(case["case_id"], "Dr. Neha Sharma", approve=True)
@@ -76,14 +84,16 @@ def test_simple_doubt_is_answered_without_a_case_and_reuses_the_insight(orch, fa
     events = orch.run("What do my reports mean?", s)
     assert not any(e.kind == "case" for e in events) and store.cases(patient_key=key) == []
     answer = next(e for e in events if e.kind == "answer")
-    assert "No case was opened" in answer.text and len(fake_llm.calls) == 2  # Insight + Communication
-    events = orch.run("Is that something serious for me?", s)  # nothing new -> Insight reused, 1 AI call
-    assert len(fake_llm.calls) == 3 and "PATIENT COMMUNICATION" in fake_llm.calls[-1]
-    assert any(e.kind == "status" and e.key == "agent-insight" and "reused" in e.title for e in events)
-    assert not any(e.kind == "case" for e in events)
+    # a doubt needs no clinician summary: one AI call (Communication, from the deterministic findings)
+    assert "No case was opened" in answer.text and len(fake_llm.calls) == 1
+    assert any(e.kind == "status" and e.key == "agent-insight" and "not needed" in e.title for e in events)
     case_id = next(e for e in orch.run("I have a headache since yesterday", s) if e.kind == "case").data["case_id"]
-    assert len(fake_llm.calls) == 5  # new symptom = new evidence -> fresh Insight, and a case for the care team
-    answer = next(e for e in orch.run("What do my reports mean?", s) if e.kind == "answer")
+    orch.drain()  # new symptom -> case; Insight written in the background for the care team
+    assert len(fake_llm.calls) == 3 and "INSIGHT GENERATION" in fake_llm.calls[-1]
+    events = orch.run("What do my reports mean?", s)  # nothing new since -> that Insight is reused, 1 AI call
+    assert len(fake_llm.calls) == 4 and "PATIENT COMMUNICATION" in fake_llm.calls[-1]
+    assert any(e.kind == "status" and e.key == "agent-insight" and "reused" in e.title for e in events)
+    answer = next(e for e in events if e.kind == "answer")
     assert case_id in answer.text and "did not change it" in answer.text and len(store.cases(patient_key=key)) == 1
 
 
@@ -165,6 +175,7 @@ def test_upload_pipeline(orch, fake_llm, engine, store, tmp_path):
     analysis = next(e for e in events if e.kind == "step" and e.data.get("agent") == "analysis")
     assert "Hemoglobin" in analysis.text
     assert store.uploads(key) and engine.patient(key).sources == ["my_cbc.txt"]
+    orch.drain()
     assert any(e.kind == "case" for e in events) and len(fake_llm.calls) == 2
 
 
@@ -187,10 +198,13 @@ def test_multi_upload_runs_pipeline_once(orch, fake_llm, engine, store, tmp_path
     step = next(e for e in events if e.kind == "step" and e.data.get("agent") == "extraction")
     assert "**2 of 5**" in step.text
     assert "already on your record" in step.text and "Someone Else" in step.text and "could not be read" in step.text
+    order = [step.text.index(f"**{n}**") for n in ("cbc.txt", "xray.txt", "cbc copy.txt", "other.txt", "notes.csv")]
+    assert order == sorted(order)  # read in parallel, reported in the order attached
     assert sorted(u["filename"] for u in store.uploads(key)) == ["cbc.txt", "xray.txt"]
     analysis = next(e for e in events if e.kind == "step" and e.data.get("agent") == "analysis")
     assert "Lab Interpreter" in analysis.text and "Radiology Analyzer" in analysis.text
-    assert len(fake_llm.calls) == 2  # one pipeline for the whole batch
+    orch.drain()
+    assert len(fake_llm.calls) == 2  # one pipeline for the whole batch (+ the care team's Insight in the background)
     assert sum(e.kind == "case" for e in events) == 1
 
 
@@ -205,6 +219,7 @@ def test_upload_with_message_answers_it_in_one_pipeline(orch, fake_llm, engine, 
     route = next(e for e in events if e.kind == "status" and e.key == "route" and e.status == "done")
     assert route.data["plan"]["symptoms"] and "ibuprofen" in route.data["plan"]["drugs"]
     assert {"fever", "cough"} <= set(engine.kg.patient_symptoms(key))
+    orch.drain()
     assert len(fake_llm.calls) == 2 and "can I take ibuprofen" in fake_llm.calls[0] and "Hemoglobin" in fake_llm.calls[0]
     assert any(e.kind == "safety" and "ibuprofen" in e.text.lower() for e in events)
     case = store.case(next(e for e in events if e.kind == "case").data["case_id"])
@@ -347,3 +362,66 @@ def test_case_is_filed_and_routed_even_when_the_ai_is_rate_limited(engine, store
     assert case["status"] == "AWAITING_RADIOLOGY" and case["payload"]["insight"]["ai_unavailable"]
     assert "Overall risk" in case["patient_draft"] and "busy" not in case["patient_draft"]
     assert any("AI explanation unavailable" in r for r in case["payload"]["review_reasons"])
+
+
+def _streaming_orch(engine, store, tmp_path, message):
+    """Orchestrator whose model streams its JSON in small chunks (like OpenAI)."""
+    from langchain_core.messages import AIMessageChunk
+    from langchain_core.outputs import ChatGenerationChunk
+
+    from conftest import FakeLLM
+    from clinicalchat.audit import Auditor
+    from clinicalchat.config import Settings
+    from clinicalchat.orchestrator import Orchestrator
+
+    class Streaming(FakeLLM):
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+            self.calls.append("\n".join(str(m.content) for m in messages))
+            text = json.dumps({"message": message, "what_it_means": ["meaning"], "next_steps": ["rest"],
+                               "seek_help_if": ["worse"], "questions_for_doctor": ["what next?"]})
+            for i in range(0, len(text), 8):
+                yield ChatGenerationChunk(message=AIMessageChunk(content=text[i:i + 8]))
+
+    llm = Streaming(cache=False, calls=[])
+    return Orchestrator(engine, llm=llm, auditor=Auditor(Settings(work_dir=tmp_path)), store=store), llm
+
+
+def test_patient_answer_streams_word_by_word_then_the_checked_answer_replaces_it(engine, store, tmp_path):
+    msg = "Your blood count shows a few values outside the usual range. Please discuss these results with your doctor."
+    orch, llm = _streaming_orch(engine, store, tmp_path, msg)
+    events = orch.run("What do my reports mean?", _session(Role.PATIENT, own="priya-desai-44", username="priya"))
+    partials = [e for e in events if e.kind == "partial"]
+    assert len(partials) >= 3 and partials[0].text.endswith("▍") and len(partials[0].text) < len(partials[-1].text)
+    kinds = [e.kind for e in events]
+    assert kinds.index("partial") < kinds.index("answer") and len(llm.calls) == 1
+    assert msg in next(e for e in events if e.kind == "answer").text
+
+
+def test_streaming_pauses_when_the_wording_fails_the_guard(engine, store, tmp_path):
+    orch, _ = _streaming_orch(engine, store, tmp_path, "Take paracetamol 500 mg twice daily and see your doctor.")
+    events = orch.run("What do my reports mean?", _session(Role.PATIENT, own="priya-desai-44", username="priya"))
+    assert not any("500 mg" in e.text for e in events if e.kind in ("partial", "answer"))
+    assert any(e.kind == "partial" and "Checking the wording" in e.text for e in events)
+
+
+def test_general_answers_are_cached_for_same_or_similar_wording(orch, fake_llm):
+    s = _session(Role.PATIENT, own="rahul-mehta-32")
+    first = next(e for e in orch.run("What is HbA1c?", s) if e.kind == "answer")
+    again = next(e for e in orch.run("what's hba1c", s) if e.kind == "answer")
+    assert len(fake_llm.calls) == 1 and again.data.get("faq_cache") and again.text == first.text
+    orch.run("What does a high LDL cholesterol level mean?", s)
+    assert next(e for e in orch.run("what does high ldl cholesterol mean", s) if e.kind == "answer").data.get("faq_cache")
+    from clinicalchat.store import faq_terms
+    assert faq_terms("What is normal haemoglobin?") == faq_terms("what's a normal hemoglobin")
+    assert faq_terms("anaemia tumours") == faq_terms("anemia tumor")
+    orch.run("How can LDL cholesterol be lowered?", s)  # different question -> answered fresh
+    assert len(fake_llm.calls) == 3
+
+
+def test_dose_guard_allows_lab_ranges_but_blocks_doses():
+    from clinicalchat.agents import check_patient_text
+
+    dose = "Contains medication doses — patient messages must not include dosing"
+    assert dose not in check_patient_text(["Normal is 12 to 15 g/dL; fasting glucose under 100 mg/dL. Ask your doctor."], False)
+    assert dose in check_patient_text(["Take 500 mg twice daily."], False)
+    assert dose in check_patient_text(["The usual amount is 5 mg/kg."], False)

@@ -34,7 +34,13 @@ class Settings:
     # LLM: "auto" = OpenAI when OPENAI_API_KEY is set, otherwise the local GitHub Copilot CLI
     llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "auto").lower())
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    # strong model for the clinician-facing Insight agent, fast model for patient-facing answers
+    openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4.1"))
+    openai_fast_model: str = field(default_factory=lambda: os.getenv("OPENAI_FAST_MODEL", "gpt-4.1-mini"))
+    openai_timeout: int = field(default_factory=lambda: int(os.getenv("OPENAI_TIMEOUT_SECONDS", "30")))
+    # output length is what drives LLM latency: hard caps per agent
+    insight_max_tokens: int = field(default_factory=lambda: int(os.getenv("INSIGHT_MAX_TOKENS", "900")))
+    communication_max_tokens: int = field(default_factory=lambda: int(os.getenv("COMMUNICATION_MAX_TOKENS", "450")))
     copilot_model: str = field(default_factory=lambda: os.getenv("COPILOT_MODEL", "gpt-4.1"))
     copilot_bin: str = field(default_factory=lambda: os.getenv("COPILOT_BIN", "copilot"))
     # one call at a time keeps the Copilot backend well under its rate limits

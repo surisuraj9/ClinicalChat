@@ -72,4 +72,9 @@ def serve() -> None:
     from clinicalchat.engine import get_engine
 
     get_engine()  # warm up: parse corpus + vector index before accepting traffic
+    import threading
+
+    from clinicalchat.llm import warm_up
+
+    threading.Thread(target=warm_up, name="llm-warm-up", daemon=True).start()  # open the OpenAI connection early
     uvicorn.run(create_app(), host=settings.host, port=settings.port)

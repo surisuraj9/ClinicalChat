@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -91,16 +92,15 @@ def _ocr_page_rows(image) -> List[List[str]]:
     return [[b[3] for b in sorted(row, key=lambda b: b[2])] for row in rows]
 
 
-_OCR = None
+_OCR = threading.local()  # one engine per thread: attached reports are read in parallel
 
 
 def _ocr_engine():
-    global _OCR
-    if _OCR is None:
+    if getattr(_OCR, "engine", None) is None:
         from rapidocr_onnxruntime import RapidOCR
 
-        _OCR = RapidOCR()
-    return _OCR
+        _OCR.engine = RapidOCR()
+    return _OCR.engine
 
 
 def load_pdf(path: Path, ocr_enabled: bool = True, cache_dir: Optional[Path] = None) -> List[Block]:

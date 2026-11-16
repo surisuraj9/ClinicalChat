@@ -48,8 +48,9 @@ class UnavailableChatModel(BaseChatModel):
         raise RuntimeError(self.reason)
 
 
-@lru_cache(maxsize=4)
-def get_chat_model(temperature: float = 0.0) -> BaseChatModel:
+@lru_cache(maxsize=8)
+def get_chat_model(temperature: float = 0.0, purpose: str = "insight") -> BaseChatModel:
+    """purpose: "insight" (clinician summary — strong model) or "fast" (patient answers — fast model, short output)."""
     settings = get_settings()
     _install_cache(settings)
     try:
@@ -59,8 +60,12 @@ def get_chat_model(temperature: float = 0.0) -> BaseChatModel:
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(model=settings.openai_model, temperature=temperature,
-                          api_key=settings.openai_api_key, timeout=60, max_retries=settings.llm_retries)
+        fast = purpose == "fast"
+        return ChatOpenAI(model=settings.openai_fast_model if fast else settings.openai_model, temperature=temperature,
+                          api_key=settings.openai_api_key, timeout=settings.openai_timeout,
+                          max_retries=settings.llm_retries, stream_usage=True,
+                          max_tokens=settings.communication_max_tokens if fast else settings.insight_max_tokens,
+                          model_kwargs={"response_format": {"type": "json_object"}})
     if provider == "copilot":
         return CopilotCLIChatModel(
             model=settings.copilot_model,
@@ -74,11 +79,27 @@ def get_chat_model(temperature: float = 0.0) -> BaseChatModel:
     raise RuntimeError("LLM_PROVIDER=fake must be injected explicitly (tests only).")
 
 
+def warm_up() -> None:
+    """Open the HTTPS connection(s) to OpenAI and load the client before the first user question (~1 s saved).
+    Skipped for the Copilot CLI (each call is a new process; a warm-up would only cost rate limit)."""
+    settings = get_settings()
+    try:
+        if resolve_provider(settings) != "openai":
+            return
+        for purpose in ("fast", "insight"):  # same HTTP connection pool the agents use; costs no tokens
+            get_chat_model(purpose=purpose).root_client.models.retrieve(
+                settings.openai_fast_model if purpose == "fast" else settings.openai_model)
+    except Exception:  # warm-up is best-effort
+        pass
+
+
 def describe_llm() -> dict:
     settings = get_settings()
     try:
         provider = resolve_provider(settings)
     except RuntimeError as exc:
         return {"provider": "unavailable", "error": str(exc)}
-    model = settings.openai_model if provider == "openai" else settings.copilot_model
-    return {"provider": provider, "model": model, "cache": settings.llm_cache}
+    if provider == "openai":
+        return {"provider": provider, "model": settings.openai_model, "fast_model": settings.openai_fast_model,
+                "cache": settings.llm_cache}
+    return {"provider": provider, "model": settings.copilot_model, "cache": settings.llm_cache}

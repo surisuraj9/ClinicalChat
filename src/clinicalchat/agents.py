@@ -13,11 +13,12 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional, Type
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Type
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.utils.json import parse_partial_json
 from pydantic import BaseModel, Field, ValidationError
 
 from clinicalchat.rbac import AGENT_LABELS, AgentName
@@ -37,11 +38,11 @@ class InsightOutput(BaseModel):
 
 
 class CommunicationOutput(BaseModel):
-    message: str = Field(description="Plain-language explanation for the patient (60-180 words, short sentences, no jargon)")
-    what_it_means: List[str] = Field(default_factory=list, description="2-4 simple bullet points")
-    next_steps: List[str] = Field(default_factory=list, description="What the patient can do next (no medicine doses)")
-    seek_help_if: List[str] = Field(default_factory=list, description="Warning signs that need urgent care")
-    questions_for_doctor: List[str] = Field(default_factory=list, description="Useful questions to ask their doctor")
+    message: str = Field(description="Plain-language answer to the patient's question (50-110 words, short sentences, no jargon)")
+    what_it_means: List[str] = Field(default_factory=list, description="2-3 simple bullet points, under 15 words each")
+    next_steps: List[str] = Field(default_factory=list, description="2-3 things the patient can do next (no medicine doses)")
+    seek_help_if: List[str] = Field(default_factory=list, description="1-3 warning signs that need urgent care")
+    questions_for_doctor: List[str] = Field(default_factory=list, description="1-2 useful questions to ask their doctor")
 
 
 INSIGHT_SYSTEM = (
@@ -159,6 +160,37 @@ class _LLMAgent:
         return result
 
 
+    def _stream(self, variables: Dict[str, Any], config: Optional[dict]) -> Iterator[Tuple[str, Any]]:
+        """Like `_invoke`, but yields ("partial", dict) while the model is still writing (OpenAI streams token by
+        token; backends without streaming yield one final chunk), then ("done", AgentResult)."""
+        start = time.perf_counter()
+        result = AgentResult(agent=self.name, label=self.label)
+        text, shown = "", 0
+        try:
+            for chunk in self.chain.stream({"rules": GROUND_RULES, "schema": schema_hint(self.output_model), **variables},
+                                           config={**(config or {}), "run_name": self.label,
+                                                   "metadata": {**(config or {}).get("metadata", {}),
+                                                                "agent": self.name.value}}):
+                if not text:
+                    result.cache_hit = bool((getattr(chunk, "response_metadata", None) or {}).get("cache_hit"))
+                text += chunk.content if isinstance(chunk.content, str) else StrOutputParser().invoke(chunk)
+                if len(text) - shown >= 24:  # re-render roughly every few words
+                    partial = parse_partial_json(_FENCE.sub("", text).strip() or "{}")
+                    if isinstance(partial, dict) and partial:
+                        shown = len(text)
+                        yield "partial", partial
+            output, ok = parse_output(text, self.output_model, self.text_field)
+            result.output, result.parsed = output.model_dump(), ok
+        except Exception as exc:  # a backend failure must not crash the chat
+            log.exception("%s failed", self.name.value)
+            result.error = str(exc)[:400]
+        result.latency_ms = int((time.perf_counter() - start) * 1000)
+        yield "done", result
+
+
+_FENCE = re.compile(r"^```(?:json)?|```$", re.M)
+
+
 class InsightGenerationAgent(_LLMAgent):
     name = AgentName.INSIGHT
     output_model = InsightOutput
@@ -184,12 +216,23 @@ class PatientCommunicationAgent(_LLMAgent):
 
     def run(self, *, question: str, patient: str, risk: str, insight: str, general: bool = False,
             config: Optional[dict] = None) -> AgentResult:
-        return self._invoke({"system": GENERAL_SYSTEM if general else COMMUNICATION_SYSTEM, "question": question,
-                             "patient": patient, "risk": risk, "insight": insight}, config)
+        return self._invoke(self._vars(question, patient, risk, insight, general), config)
+
+    def stream(self, *, question: str, patient: str, risk: str, insight: str, general: bool = False,
+               config: Optional[dict] = None) -> Iterator[Tuple[str, Any]]:
+        return self._stream(self._vars(question, patient, risk, insight, general), config)
+
+    @staticmethod
+    def _vars(question: str, patient: str, risk: str, insight: str, general: bool) -> Dict[str, Any]:
+        return {"system": GENERAL_SYSTEM if general else COMMUNICATION_SYSTEM, "question": question,
+                "patient": patient, "risk": risk, "insight": insight}
 
 
 # ---------------------------------------------------------------- patient-text guard (deterministic)
-_DOSE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:mg|mcg|µg|g|ml|units?|iu)\b(?:\s*(?:once|twice|daily|a day|per day|bd|od|tds))?", re.I)
+# a lab concentration ("15 g/dL", "126 mg per decilitre") is a result, not a dose
+_DOSE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:mg|mcg|µg|g|ml|units?|iu)\b"
+                   r"(?!\s*(?:/|per\s+)(?:dl|l|ml|deciliter|decilitre|liter|litre|cu\s?mm|mm3|ul|µl)\b)"
+                   r"(?:\s*(?:once|twice|daily|a day|per day|bd|od|tds))?", re.I)
 _DEFINITIVE = re.compile(r"\byou (?:definitely |certainly )?(?:have|are suffering from|are diagnosed with) "
                          r"(?:cancer|a tumou?r|leukaemia|leukemia|kidney failure|heart failure|a stroke|diabetes|hiv|pneumonia)\b", re.I)
 _SELF_MED = re.compile(r"\b(stop|start|double|increase|decrease) (?:taking )?(?:your |the )?(?:medicine|medication|tablets?|insulin|dose)\b", re.I)

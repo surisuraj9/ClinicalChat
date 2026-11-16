@@ -437,10 +437,16 @@ def case_markdown(case: dict) -> str:
         md += "\n> 🟠 **Review Required** — " + "; ".join(pay["review_reasons"])
     if pay.get("facts"):
         md += "\n\n**🔬 Deterministic findings**\n```\n" + pay["facts"][:1500] + "\n```"
-    if ins.get("answer"):
-        md += f"\n\n**💡 Clinical insight** (confidence {ins.get('confidence', 0):.0%})\n{ins['answer']}"
+    if pay.get("insight_pending"):
+        md += "\n\n**💡 Clinical insight** — ⏳ the AI is writing it in the background; reopen the case in a moment."
+    elif ins.get("answer"):
+        conf = ins.get("confidence")
+        md += (f"\n\n**💡 Clinical insight**" + (f" (confidence {conf:.0%})" if isinstance(conf, (int, float)) else "")
+               + f"\n{ins['answer']}")
         if ins.get("next_steps"):
             md += "\n\n**Next steps:** " + "; ".join(map(str, ins["next_steps"]))
+    elif pay.get("insight_error"):
+        md += f"\n\n**💡 Clinical insight** — not available ({pay['insight_error'][:120]}). Use the findings above."
     md += _radiology_md(pay) + _triage_md(pay)
     md += "\n\n---\n**💬 Shown to the patient as an AI assessment (latest):**\n\n" + "\n".join("> " + line for line in case["patient_draft"].splitlines())
     if pay.get("guard_issues"):
@@ -545,6 +551,7 @@ def _stream(events: Iterator[Event], user_text: str, history: List[dict], sessio
     idx = len(history) - 1
     findings: Dict[str, str] = {}
     f_idx: Optional[int] = None
+    p_idx: Optional[int] = None
     states: Dict[str, tuple] = {}
     session.busy = True
     yield history, agent_strip(role, states)
@@ -575,7 +582,9 @@ def _stream(events: Iterator[Event], user_text: str, history: List[dict], sessio
                         states[agent] = ("failed" if failed else "done", note)
             elif ev.kind == "step":
                 findings[ev.title] = f"**{ev.title}**\n{ev.text}"
-                content = {"role": "assistant", "content": "### 🔎 What the agents found\n" + "\n\n".join(findings.values())}
+                head = ("### ⚡ Quick check — your findings (instant, no AI)\n" if role == Role.PATIENT
+                        else "### 🔎 What the agents found\n")
+                content = {"role": "assistant", "content": head + "\n\n".join(findings.values())}
                 if f_idx is None:
                     history.append(content)
                     f_idx = len(history) - 1
@@ -589,8 +598,19 @@ def _stream(events: Iterator[Event], user_text: str, history: List[dict], sessio
                 history.append({"role": "assistant", "content": f"🔒 {ev.text}"})
             elif ev.kind == "case":
                 history.append({"role": "assistant", "content": f"### {ev.title}\n{ev.text}"})
+            elif ev.kind == "partial":  # streamed answer: one message updated in place
+                content = {"role": "assistant", "content": f"### {ev.title}\n{ev.text}"}
+                if p_idx is None:
+                    history.append(content)
+                    p_idx = len(history) - 1
+                else:
+                    history[p_idx] = content
             elif ev.kind == "answer":
-                history.append({"role": "assistant", "content": f"### {ev.title}\n{ev.text}"})
+                content = {"role": "assistant", "content": f"### {ev.title}\n{ev.text}"}
+                if p_idx is not None and ev.data.get("agent") == "communication":
+                    history[p_idx], p_idx = content, None  # the checked final answer replaces the streamed draft
+                else:
+                    history.append(content)
             yield history, agent_strip(role, states)
     except Exception as exc:  # never leave the UI hanging
         history.append({"role": "assistant", "content": f"⚠️ Something went wrong: {exc}"})

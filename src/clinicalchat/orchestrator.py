@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -41,7 +42,7 @@ from clinicalchat.router import RoutePlan, Router
 from clinicalchat import workflow as wf
 from clinicalchat.store import Store, get_store
 
-HISTORY_TURNS = 3
+HISTORY_TURNS = 2  # short history keeps prompts (and time-to-first-word) small
 REVIEW_CONFIDENCE = 0.6
 LEVEL_BADGE = {"LOW": "🟢 LOW", "MODERATE": "🟡 MODERATE", "HIGH": "🟠 HIGH", "CRITICAL": "🔴 CRITICAL"}
 
@@ -109,14 +110,17 @@ class Orchestrator:
                  store: Optional[Store] = None):
         self.engine = engine
         self.router = Router(engine)
-        self.llm = llm or get_chat_model()
+        self.llm = llm or get_chat_model(purpose="insight")
         self.auditor = auditor or Auditor(engine.settings)
         self.store = store or get_store()
         self.extraction = DataExtractionAgent(engine)
         self.analysis = ClinicalAnalysisAgent(engine)
         self.risk = RiskDetectionAgent(engine.kg)
+        self.fast_llm = llm or get_chat_model(purpose="fast")
         self.insight = InsightGenerationAgent(self.llm)
-        self.communication = PatientCommunicationAgent(self.llm)
+        self.communication = PatientCommunicationAgent(self.fast_llm)
+        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="insight")
+        self._background: List[Future] = []
 
     # ------------------------------------------------------------------ chat question
     def ask(self, question: str, session: ChatSession) -> Iterator[Event]:
@@ -210,15 +214,30 @@ class Orchestrator:
         lines: List[str] = []
         seen: set = set()
         total = len(files)
-        for i, (path, name) in enumerate(files, 1):
-            prefix = f"({i}/{total}) " if total > 1 else ""
-            yield Event("status", f"{label} — reading {prefix}{name}", "Extracting text (OCR for scans), sections and lab values…",
-                        "pending", "agent-extraction")
+        def read(item: Tuple[Path, str]):
+            path, name = item
             try:
-                doc = parse_upload(Path(path), patient_key=key, patient_name=patient.name, report_type=report_type,
-                                   uploaded_by=session.username, uploaded_at=_now(), display_name=name,
-                                   cache_dir=self.engine.settings.work_dir / "ocr_cache")
+                return parse_upload(Path(path), patient_key=key, patient_name=patient.name, report_type=report_type,
+                                    uploaded_by=session.username, uploaded_at=_now(), display_name=name,
+                                    cache_dir=self.engine.settings.work_dir / "ocr_cache"), None
             except Exception as exc:
+                return None, exc
+
+        # read / OCR all files at the same time; then check and add them in the order they were attached
+        yield Event("status", f"{label} — reading {total} file{'s' if total > 1 else ''}"
+                    + (" in parallel" if total > 1 else ""), "Extracting text (OCR for scans), sections and lab values…",
+                    "pending", "agent-extraction")
+        results: Dict[int, tuple] = {}
+        with ThreadPoolExecutor(max_workers=min(4, total), thread_name_prefix="upload") as pool:
+            futures = {pool.submit(read, f): i for i, f in enumerate(files)}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+                if total > 1:
+                    yield Event("status", f"{label} — read {len(results)}/{total}", f"{files[futures[fut]][1]} done",
+                                "pending", "agent-extraction")
+        for i, (path, name) in enumerate(files):
+            doc, exc = results[i]
+            if exc is not None:
                 lines.append(f"- ❌ **{name}** — could not be read: {str(exc)[:160]}")
                 continue
             if doc.doc_id in seen or doc.doc_id in self.engine.docs_by_id:
@@ -406,67 +425,125 @@ class Orchestrator:
                         "A clinician will check it. If you feel unwell, don't wait — see a doctor.")
             yield Event("guidance", "What to do now", text, data={"level": guidance})
 
-        # 4) 💡 Insight Generation (LLM)
+        if is_patient:
+            yield from self._patient_answer(question, session, plan, turn, run, upload_doc_ids)
+            return
+
+        # 4) 💡 Insight Generation (LLM) — staff
         config = self._config(session)
         label = AGENT_LABELS[AgentName.INSIGHT]
-        audience = policy(Role.CLINICIAN if is_patient else role).audience
-        reused = None
-        if is_patient and plan.patient_key:
-            run.evidence_fp = self._evidence_fp(plan.patient_key, risk.risk_level)
-            run.case_fp = self._evidence_fp(plan.patient_key, risk.risk_level, reads=False)
-            run.file_case = self._needs_case(plan, run, upload_doc_ids, risk)
-            if not (upload_doc_ids or run.new_symptoms or plan.drugs or plan.allergens):
-                reused = self.store.insight(plan.patient_key, run.evidence_fp)
-        if reused is not None:
-            ins = AgentResult(agent=AgentName.INSIGHT, label=label, output=reused)
-            yield Event("status", f"{label} — reused", "Nothing new since the last assessment — reusing it (no AI call)",
-                        "done", "agent-insight")
-        else:
-            yield Event("status", f"{label} — writing", "Consolidating the findings (AI)…" if not is_patient else
-                        "Summarising your records and findings (AI)…", "pending", "agent-insight")
-            ins = self._run_insight(question, audience, plan, ext, an, risk, session, config, run)
-            if is_patient and plan.patient_key and not ins.error and ins.parsed:
-                self.store.save_insight(plan.patient_key, run.evidence_fp, ins.output or {})
+        yield Event("status", f"{label} — writing", "Consolidating the findings (AI)…", "pending", "agent-insight")
+        ins = self._run_insight(question, policy(role).audience, plan, ext, an, risk, session.history_text(), config, run)
         out = ins.output or {}
         run.review_reasons = self._review_reasons(ext, an, risk, ins)
-        if reused is None:
-            yield Event("status", f"{label} — {'failed' if ins.error else 'done'}", _timing(ins), "done", "agent-insight")
+        yield Event("status", f"{label} — {'failed' if ins.error else 'done'}", _timing(ins), "done", "agent-insight")
         session.last_insight = {"patient_key": plan.patient_key, "question": question, "output": out,
                                 "risk": risk.risk_level, "facts": an.facts_text()}
-        if not is_patient:
-            md = render_insight(ins, run.review_reasons, ext.sources)
-            turn.answers.append({"label": label, "markdown": md, "summary": str(out.get("answer", ins.error))[:300]})
-            yield Event("answer", label, md, data={"agent": "insight", "review": run.review_reasons})
-            if plan.mode != "explain":
+        md = render_insight(ins, run.review_reasons, ext.sources)
+        turn.answers.append({"label": label, "markdown": md, "summary": str(out.get("answer", ins.error))[:300]})
+        yield Event("answer", label, md, data={"agent": "insight", "review": run.review_reasons})
+        if plan.mode == "explain" and not ins.error:
+            yield from self._communicate(question, session, plan, turn, run, out, risk.clinical_level,
+                                         bool(an.abnormal or risk.escalate))
+
+    def _patient_answer(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
+                        upload_doc_ids: Sequence[str]) -> Iterator[Event]:
+        """Patients wait for ONE AI call (Communication). The clinician-facing Insight is not on the patient's
+        critical path: it is reused when nothing changed, or written in the background once a case is opened."""
+        ext, an, risk, key = run.ext, run.analysis, run.risk, plan.patient_key
+        label = AGENT_LABELS[AgentName.INSIGHT]
+        cached = None
+        if key:
+            run.evidence_fp = self._evidence_fp(key, risk.risk_level)
+            run.case_fp = self._evidence_fp(key, risk.risk_level, reads=False)
+            run.file_case = self._needs_case(plan, run, upload_doc_ids, risk)
+            if not (upload_doc_ids or run.new_symptoms or plan.drugs or plan.allergens):
+                cached = self.store.insight(key, run.evidence_fp)
+        run.review_reasons = self._review_reasons(ext, an, risk, AgentResult(agent=AgentName.INSIGHT, label=label,
+                                                                             output=cached or {}))
+        background = bool(key and run.file_case and cached is None)
+        if cached is not None:
+            yield Event("status", f"{label} — reused", "Nothing new since the last assessment — reusing it (no AI call)",
+                        "done", "agent-insight")
+        elif background:
+            yield Event("status", f"{label} — for the care team", "The clinical summary for your care team is written "
+                        "in the background — you don't wait for it", "done", "agent-insight")
+        else:
+            yield Event("status", f"{label} — not needed", "Your question is answered from the findings above "
+                        "(no clinical summary needed)", "done", "agent-insight")
+        basis = cached or self._rule_based_insight(question, run)
+        session.last_insight = {"patient_key": key, "question": question, "output": basis, "risk": risk.risk_level,
+                                "facts": an.facts_text()}
+        yield from self._communicate(question, session, plan, turn, run, basis, risk.clinical_level,
+                                     bool(an.abnormal or risk.escalate))
+        if background and turn.case_id:
+            self._insight_in_background(turn.case_id, question, plan, run, session.history_text(), self._config(session))
+
+    def _rule_based_insight(self, question: str, run: _Run) -> Dict[str, Any]:
+        """What the Communication agent writes from when no AI clinical summary is needed or ready yet:
+        the deterministic findings plus a short excerpt of the relevant records."""
+        an, ext = run.analysis, run.ext
+        excerpt = self.engine.records_context(question, ext.sections[:3], ext.focus, reference_k=1) if ext else ""
+        return {"key_findings": an.facts_text().splitlines()[:25] if an else [],
+                "possible_conditions": an.possible_conditions[:6] if an else [],
+                "records_excerpt": excerpt[:2500], "source": "rule-based findings (validated code)"}
+
+    def _insight_in_background(self, case_id: str, question: str, plan: RoutePlan, run: _Run, history: str,
+                               config: dict) -> None:
+        self.store.mark_insight_pending(case_id)
+        audience = policy(Role.CLINICIAN).audience
+
+        def work() -> None:
+            ins = self._run_insight(question, audience, plan, run.ext, run.analysis, run.risk, history, config, None)
+            if ins.error or not ins.parsed:
+                self.store.set_case_insight(case_id, None, error=ins.error or "AI output could not be validated")
                 return
+            self.store.save_insight(plan.patient_key, run.evidence_fp, ins.output or {})
+            self.store.set_case_insight(case_id, ins.output or {})
 
-        # 5) 💬 Patient Communication (LLM) — patients: held for clinician validation
-        if ins.error:
-            if is_patient and plan.patient_key:
-                yield from self._file_case_without_ai(question, session, plan, turn, run, ins.error)
-            elif is_patient:
-                yield Event("answer", "💬 Patient Communication", "_The AI assistant is busy right now, so I could not prepare "
-                            "a written explanation. The safety guidance above still applies — please try again shortly._",
-                            data={"agent": "communication"})
-            return
-        yield from self._communicate(question, session, plan, turn, run, out, risk.clinical_level, bool(an.abnormal or risk.escalate))
+        self._background.append(self._pool.submit(work))
 
-    def _run_insight(self, question, audience, plan, ext, an, risk, session, config, run) -> AgentResult:
+    def drain(self, timeout: float = 600) -> None:
+        """Wait for background work (Insight for the care team). Used by tests and on shutdown."""
+        for f in list(self._background):
+            f.result(timeout=timeout)
+        self._background.clear()
+
+    def _run_insight(self, question, audience, plan, ext, an, risk, history, config, run) -> AgentResult:
         ins = self.insight.run(question=question, audience=audience, patient=self.engine.patient_summary(plan.patient_key),
                                extraction=self._extraction_brief(ext), facts=an.facts_text(), risk=self._risk_brief(risk),
                                feedback=self._feedback(), context=self.engine.records_context(question, ext.sections, ext.focus),
-                               history=session.history_text(), config=config)
-        run.llm.append(ins)
+                               history=history, config=config)
+        if run is not None:
+            run.llm.append(ins)
         return ins
+
+    def _write(self, title: str, session: ChatSession, abnormal: bool, **kwargs) -> Iterator[Event]:
+        """Run the Communication agent, streaming the answer as it is written. Each partial is passed through the
+        deterministic guard first; if the wording needs a check, streaming pauses and only the final checked
+        answer is shown. Returns the AgentResult."""
+        com, paused = None, False
+        for kind, value in self.communication.stream(config=self._config(session), **kwargs):
+            if kind == "done":
+                com = value
+            elif not paused:
+                md = communication_markdown(value)
+                if any(k in i for i in check_patient_text([md], abnormal) for k in BLOCKING_GUARD):
+                    paused = True
+                    md = "_Checking the wording before showing it…_"
+                if md.strip():
+                    yield Event("partial", title, md + ("" if paused else " ▍"), data={"agent": "communication"})
+        return com
 
     def _communicate(self, question: str, session: ChatSession, plan: RoutePlan, turn: Turn, run: _Run,
                      insight: Dict[str, Any], risk_level: str, abnormal: bool) -> Iterator[Event]:
         is_patient = session.role == Role.PATIENT
         label = AGENT_LABELS[AgentName.COMMUNICATION]
         yield Event("status", f"{label} — writing", "Writing a plain-language explanation (AI)…", "pending", "agent-communication")
-        com = self.communication.run(question=question, patient=self.engine.patient_summary(plan.patient_key),
+        com = yield from self._write("💬 Writing your answer…" if is_patient else f"{label} — writing…", session, abnormal,
+                                     question=question, patient=self.engine.patient_summary(plan.patient_key),
                                      risk=f"{risk_level}: {PATIENT_GUIDANCE[risk_level]}",
-                                     insight=json.dumps(insight, ensure_ascii=False)[:6000], config=self._config(session))
+                                     insight=json.dumps(insight, ensure_ascii=False)[:6000])
         run.llm.append(com)
         yield Event("status", f"{label} — {'failed' if com.error else 'done'}", _timing(com), "done", "agent-communication")
         if com.error:
@@ -587,15 +664,23 @@ class Orchestrator:
         if safety_md:
             turn.safety = safety_md
             yield Event("safety", "🛡️ Safety check", safety_md)
-        context, sources = self.engine.reference_context(question)
         label = AGENT_LABELS[AgentName.COMMUNICATION]
+        p = self.engine.patient(plan.patient_key)
+        allergies = ", ".join(sorted(a.allergen for a in p.allergies)) if p and p.allergies else "none recorded"
+        hit = self.store.faq_lookup(question, allergies)
+        if hit:
+            yield Event("status", f"{label} — instant", f"Answered before (“{hit['question'][:60]}”) — reused, no AI call",
+                        "done", "agent-communication")
+            md = hit["answer"]
+            turn.answers.append({"label": label, "markdown": md, "summary": md[:300]})
+            yield Event("answer", label, md, data={"agent": "communication", "faq_cache": True})
+            return
+        context, sources = self.engine.reference_context(question)
         yield Event("status", f"{label} — answering", "Looking up reference information and writing an answer (AI)…",
                     "pending", "agent-communication")
-        p = self.engine.patient(plan.patient_key)
-        allergies = ", ".join(a.allergen for a in p.allergies) if p and p.allergies else "none recorded"
-        com = self.communication.run(question=question, patient=f"Documented allergies: {allergies}",
-                                     risk="Not applicable (general question).", insight=context, general=True,
-                                     config=self._config(session))
+        com = yield from self._write("💬 Writing your answer…", session, False, question=question,
+                                     patient=f"Documented allergies: {allergies}",
+                                     risk="Not applicable (general question).", insight=context, general=True)
         run.llm.append(com)
         yield Event("status", f"{label} — {'failed' if com.error else 'done'}", _timing(com), "done", "agent-communication")
         if com.error:
@@ -604,6 +689,8 @@ class Orchestrator:
             md = communication_markdown(com.output or {})
             md += "\n\n<sub>ℹ️ General health information, not personal medical advice."
             md += f" Sources: {', '.join(sources)}</sub>" if sources else "</sub>"
+            if com.parsed and not any(k in i for i in check_patient_text([md], False) for k in BLOCKING_GUARD):
+                self.store.faq_save(question, allergies, md)
         turn.answers.append({"label": label, "markdown": md, "summary": md[:300]})
         yield Event("answer", label, md, data={"agent": "communication"})
 
@@ -813,13 +900,13 @@ def patient_assessment_markdown(insight: Dict[str, Any], risk_level: str, draft:
     """What the patient sees straight away: the AI's predicted health picture + plain-language explanation.
     Clearly labelled as an AI assessment awaiting clinician confirmation; unsafe wording is never shown."""
     conditions = [str(c) for c in insight.get("possible_conditions") or [] if str(c).strip()][:5]
-    try:
-        conf = float(insight.get("confidence", 0))
-    except (TypeError, ValueError):
-        conf = 0.0
-    md = f"**Overall risk:** {RISK_BADGE.get(risk_level, risk_level)} · **AI confidence:** {conf:.0%}"
+    conf = insight.get("confidence")
+    md = f"**Overall risk:** {RISK_BADGE.get(risk_level, risk_level)}"
+    if isinstance(conf, (int, float)) and not insight.get("ai_unavailable"):
+        md += f" · **AI confidence:** {conf:.0%}"
     if conditions:
-        md += ("\n\n**What your reports and symptoms may point to** _(AI prediction — not a diagnosis)_:\n"
+        who = "automatic checks" if insight.get("source") else "AI prediction"
+        md += (f"\n\n**What your reports and symptoms may point to** _({who} — not a diagnosis)_:\n"
                + "\n".join(f"- {c}" for c in conditions))
     blocking = [i for i in issues if any(k in i for k in BLOCKING_GUARD)]
     if blocking:
