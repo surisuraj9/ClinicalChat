@@ -29,12 +29,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------- structured outputs (Pydantic v2)
 class InsightOutput(BaseModel):
     answer: str = Field(description="Direct answer to the question for the stated audience (markdown, 80-220 words)")
-    key_findings: List[str] = Field(default_factory=list, description="Most important findings, one short line each")
-    possible_conditions: List[str] = Field(default_factory=list, description="Conditions the findings may suggest (not a diagnosis)")
-    next_steps: List[str] = Field(default_factory=list, description="Recommended follow-up tests / actions")
-    additional_data_needed: List[str] = Field(default_factory=list, description="Information that is missing to be confident")
+    key_findings: List[str] = Field(default_factory=list, description="Most important findings, at most 6, one short line each")
+    possible_conditions: List[str] = Field(default_factory=list, description="Conditions the findings may suggest (not a diagnosis), at most 4")
+    next_steps: List[str] = Field(default_factory=list, description="Recommended follow-up tests / actions, at most 5")
+    additional_data_needed: List[str] = Field(default_factory=list, description="Information that is missing to be confident, at most 3")
     confidence: float = Field(default=0.7, description="Your confidence in this insight, number between 0 and 1")
-    sources: List[str] = Field(default_factory=list, description="File names of the records used")
+    sources: List[str] = Field(default_factory=list, description="File names of the records used, at most 5")
 
 
 class CommunicationOutput(BaseModel):
@@ -141,15 +141,25 @@ class _LLMAgent:
     def __init__(self, llm: BaseChatModel, prompt: ChatPromptTemplate):
         self.llm = llm
         self.label = AGENT_LABELS[self.name]
+        self.prompt = prompt
         self.chain = prompt | llm  # LCEL; parsing happens after so cache metadata stays visible
 
     def _invoke(self, variables: Dict[str, Any], config: Optional[dict]) -> AgentResult:
         start = time.perf_counter()
         result = AgentResult(agent=self.name, label=self.label)
+        inputs = {"rules": GROUND_RULES, "schema": schema_hint(self.output_model), **variables}
+        cfg = {**(config or {}), "run_name": self.label,
+               "metadata": {**(config or {}).get("metadata", {}), "agent": self.name.value}}
         try:
-            message = self.chain.invoke({"rules": GROUND_RULES, "schema": schema_hint(self.output_model), **variables},
-                                        config={**(config or {}), "run_name": self.label,
-                                                "metadata": {**(config or {}).get("metadata", {}), "agent": self.name.value}})
+            try:
+                message = self.chain.invoke(inputs, config=cfg)
+            except Exception as exc:
+                cap = getattr(self.llm, "max_tokens", None)
+                if not (cap and _hit_length_limit(exc)):
+                    raise
+                # a long answer (e.g. many lab values) ran out of room: retry once with double the output budget
+                log.warning("%s hit the %d-token output cap; retrying with %d", self.name.value, cap, cap * 2)
+                message = (self.prompt | self.llm.bind(max_tokens=cap * 2)).invoke(inputs, config=cfg)
             result.cache_hit = bool((getattr(message, "response_metadata", None) or {}).get("cache_hit"))
             output, ok = parse_output(StrOutputParser().invoke(message), self.output_model, self.text_field)
             result.output, result.parsed = output.model_dump(), ok
@@ -180,6 +190,10 @@ class _LLMAgent:
                         shown = len(text)
                         yield "partial", partial
             output, ok = parse_output(text, self.output_model, self.text_field)
+            if not ok:  # cut off by the output cap: keep the complete fields that were written
+                partial = parse_partial_json(_FENCE.sub("", text).strip() or "{}")
+                if isinstance(partial, dict) and partial.get(self.text_field):
+                    output, ok = parse_output(json.dumps(partial), self.output_model, self.text_field)
             result.output, result.parsed = output.model_dump(), ok
         except Exception as exc:  # a backend failure must not crash the chat
             log.exception("%s failed", self.name.value)
@@ -189,6 +203,10 @@ class _LLMAgent:
 
 
 _FENCE = re.compile(r"^```(?:json)?|```$", re.M)
+
+
+def _hit_length_limit(exc: Exception) -> bool:
+    return type(exc).__name__ == "LengthFinishReasonError" or "length limit was reached" in str(exc)
 
 
 class InsightGenerationAgent(_LLMAgent):

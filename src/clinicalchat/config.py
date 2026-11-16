@@ -39,8 +39,8 @@ class Settings:
     openai_fast_model: str = field(default_factory=lambda: os.getenv("OPENAI_FAST_MODEL", "gpt-4.1-mini"))
     openai_timeout: int = field(default_factory=lambda: int(os.getenv("OPENAI_TIMEOUT_SECONDS", "30")))
     # output length is what drives LLM latency: hard caps per agent
-    insight_max_tokens: int = field(default_factory=lambda: int(os.getenv("INSIGHT_MAX_TOKENS", "900")))
-    communication_max_tokens: int = field(default_factory=lambda: int(os.getenv("COMMUNICATION_MAX_TOKENS", "450")))
+    insight_max_tokens: int = field(default_factory=lambda: int(os.getenv("INSIGHT_MAX_TOKENS", "1600")))
+    communication_max_tokens: int = field(default_factory=lambda: int(os.getenv("COMMUNICATION_MAX_TOKENS", "600")))
     copilot_model: str = field(default_factory=lambda: os.getenv("COPILOT_MODEL", "gpt-4.1"))
     copilot_bin: str = field(default_factory=lambda: os.getenv("COPILOT_BIN", "copilot"))
     # one call at a time keeps the Copilot backend well under its rate limits

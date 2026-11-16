@@ -445,3 +445,21 @@ def test_reset_patient_removes_uploads_cases_and_index_but_keeps_login(orch, eng
     assert vs.purge_uploads(key) > 0 and vs.collection.count() == dataset_chunks
     assert not store.uploads(key) and not store.cases(patient_key=key) and store.get_user("reset.me")
     assert not any(s.patient_key == key for s in vs.sections.values())
+
+
+def test_insight_retries_with_a_bigger_budget_when_the_output_cap_is_hit():
+    from conftest import FakeLLM
+    from clinicalchat.agents import InsightGenerationAgent
+
+    class Capped(FakeLLM):
+        max_tokens: int = 100
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            if kwargs.get("max_tokens", self.max_tokens) < 200:
+                raise RuntimeError("Could not parse response content as the length limit was reached")
+            return super()._generate(messages, stop, run_manager, **kwargs)
+
+    llm = Capped(cache=False, calls=[])
+    res = InsightGenerationAgent(llm).run(question="Interpret the labs", audience="clinician", patient="p", extraction="e",
+                                          facts="f", risk="r", feedback="", context="c", history="")
+    assert not res.error and res.parsed and res.output["possible_conditions"] == ["Anaemia"]
