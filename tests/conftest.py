@@ -3,8 +3,8 @@ import os
 import re
 from typing import List
 
-# tests never use the real keys in .env: no OpenAI spend, no test traces in Langfuse
-for _var in ("OPENAI_API_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
+# tests never use the real keys in .env: no OpenAI or Tavily spend, no test traces in Langfuse
+for _var in ("OPENAI_API_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "TAVILY_API_KEY"):
     os.environ[_var] = ""
 
 import pytest

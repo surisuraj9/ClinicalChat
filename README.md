@@ -95,6 +95,23 @@ cp .env.example .env && chmod 600 .env   # .env is git-ignored
 With the Langfuse keys set, every AI call is traced to Langfuse (agent name, model, prompt, tokens, latency). The JSONL audit log in `data/audit/` is always on.
 - **Copilot CLI back end:** calls run one at a time; the adapter stops at the first HTTP 429 and a 2-minute circuit breaker blocks further calls.
 
+### 🌐 Web search (Tavily, trusted sites only)
+
+With `TAVILY_API_KEY` set, three steps can use current information from trusted medical sites:
+
+| Where | When | Sites | Effect |
+|---|---|---|---|
+| Patient general question | every general question (waits ≤ 2.5 s, then answers without it) | WHO, NIH/MedlinePlus, CDC, NHS, Mayo Clinic, Cleveland Clinic… | answer uses the sources; links listed under "🌐 From trusted health sites" |
+| Clinician / radiologist / coordinator | the question asks for guidelines, evidence, treatment, management, dosing… | NICE, NCBI/PubMed, KDIGO, AHA/ACC, IDSA, Radiopaedia… | Insight cites `[W1]…` and lists the sources |
+| Medicine the knowledge graph does not know | "can I take / is X safe / prescribed X" with an unknown brand | DailyMed, MedlinePlus, drugs.com, 1mg, EMA, FDA | ingredients found → the normal allergy / interaction checks run on them |
+
+Guardrails:
+- **No patient details leave the server.** Patient names, record keys, IDs/MRNs, dates, phone numbers and e-mails are stripped from every query (`websearch.deidentify`). Drug look-ups send only the medicine name.
+- **Only trusted domains.** They are passed to Tavily and checked again on every result.
+- **Web results can only add warnings.** They never change the risk level or clear an allergy warning. If a medicine's ingredients can't be recognised, it says so and asks the patient to check with a pharmacist.
+- **Logged and cached.** Results are cached for 7 days (`web_cache` table), each search is in the audit log (`web_searches`) and appears as a span in Langfuse.
+- **Optional.** Without a key, or with `WEB_SEARCH=off`, the app behaves exactly as before.
+
 ## Architecture
 
 ```mermaid

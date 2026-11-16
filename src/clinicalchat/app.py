@@ -53,7 +53,10 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "llm": describe_llm()}
+        settings = get_settings()
+        return {"status": "ok", "llm": describe_llm(),
+                "web_search": "tavily" if settings.tavily_api_key and settings.web_search != "off" else "off",
+                "tracing": "langfuse" if settings.langfuse_enabled else "off"}
 
     theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="teal", neutral_hue="slate")
     return gr.mount_gradio_app(

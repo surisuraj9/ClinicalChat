@@ -51,7 +51,8 @@ INSIGHT_SYSTEM = (
     "reference ranges, imaging findings, allergy/drug safety, symptom differential, inconsistencies) and RISK "
     "DETECTION (rule-based risk level). Consolidate their outputs and the records into clear, actionable insight "
     "that answers the question. Recommend next steps (tests, referrals, follow-up). State what additional data "
-    "would be needed and give an honest confidence.")
+    "would be needed and give an honest confidence. If WEB EVIDENCE is provided, use it only for guideline / treatment "
+    "statements, cite it as [W1], [W2]…, and never let it override the patient's own records.")
 COMMUNICATION_SYSTEM = (
     "You are the PATIENT COMMUNICATION agent. Translate the clinical insight below into a short, warm, plain-language "
     "explanation for the patient. Keep it informational, never diagnostic: say what the findings MAY mean, not what the "

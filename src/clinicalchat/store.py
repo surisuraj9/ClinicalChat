@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE TABLE IF NOT EXISTS faq_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT, terms TEXT NOT NULL, allergies TEXT NOT NULL, question TEXT NOT NULL,
     answer TEXT NOT NULL, hits INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS web_cache (
+    kind TEXT NOT NULL, query TEXT NOT NULL, results TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY (kind, query));
 CREATE TABLE IF NOT EXISTS insights (
     patient_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, insight TEXT NOT NULL, created TEXT NOT NULL);
 """
@@ -243,6 +245,17 @@ class Store:
         """Imaging documents of this patient that a radiologist has already read (in any case)."""
         return sorted({d for c in self.cases(patient_key=patient_key)
                        for d in (c["payload"].get("radiology") or {}).get("doc_ids", [])})
+
+    # ------------------------------------------------------------------ web search cache (no patient data)
+    def web_lookup(self, kind: str, query: str, days: int = 7) -> Optional[List[Dict[str, Any]]]:
+        rows = self._rows("SELECT results FROM web_cache WHERE kind=? AND query=? AND created >= datetime('now', ?)",
+                          (kind, query.lower(), f"-{days} days"))
+        return json.loads(rows[0]["results"]) if rows else None
+
+    def web_save(self, kind: str, query: str, results: List[Dict[str, Any]]) -> None:
+        if results:
+            self._exec("INSERT OR REPLACE INTO web_cache VALUES (?,?,?,datetime('now'))",
+                       (kind, query.lower(), json.dumps(results)))
 
     def purge_patient(self, patient_key: str, delete_login: bool = False) -> Dict[str, int]:
         """Remove everything stored for a patient (uploads, facts, cases + their review history, cached insight).

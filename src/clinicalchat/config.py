@@ -53,6 +53,11 @@ class Settings:
     embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"))
     ocr_enabled: bool = field(default_factory=lambda: _bool("OCR_ENABLED", True))
 
+    # Tavily web search (trusted medical sites only); off when no key
+    tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
+    web_search: str = field(default_factory=lambda: os.getenv("WEB_SEARCH", "auto").lower())  # auto | off
+    web_search_timeout: float = field(default_factory=lambda: float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", "4")))
+    web_search_max_results: int = field(default_factory=lambda: int(os.getenv("WEB_SEARCH_MAX_RESULTS", "4")))
     langfuse_public_key: str = field(default_factory=lambda: os.getenv("LANGFUSE_PUBLIC_KEY", ""))
     langfuse_secret_key: str = field(default_factory=lambda: os.getenv("LANGFUSE_SECRET_KEY", ""))
     langfuse_host: str = field(default_factory=lambda: os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"))

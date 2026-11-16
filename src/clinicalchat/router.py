@@ -53,6 +53,7 @@ class RoutePlan:
     symptoms: List[str] = field(default_factory=list)
     check_allergies: bool = False
     wants_review: bool = False  # patient explicitly asked for a doctor to look at it -> open a case
+    drug_notes: List[str] = field(default_factory=list)  # web look-ups of medicines not in the knowledge graph
     blocked: str = ""
     notes: List[str] = field(default_factory=list)
 

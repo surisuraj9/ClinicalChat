@@ -463,3 +463,71 @@ def test_insight_retries_with_a_bigger_budget_when_the_output_cap_is_hit():
     res = InsightGenerationAgent(llm).run(question="Interpret the labs", audience="clinician", patient="p", extraction="e",
                                           facts="f", risk="r", feedback="", context="c", history="")
     assert not res.error and res.parsed and res.output["possible_conditions"] == ["Anaemia"]
+
+
+class _FakeWeb:
+    """Stands in for Tavily: records queries, returns canned trusted-site results."""
+    enabled = True
+
+    def __init__(self, results):
+        self.results, self.queries = results, []
+
+    def search(self, query, kind, names=(), config=None):
+        from clinicalchat.websearch import WebResult, WebSearchOutcome, deidentify
+
+        clean = deidentify(query, names)
+        self.queries.append((kind, clean))
+        return WebSearchOutcome(kind=kind, query=clean, results=[WebResult(**r) for r in self.results.get(kind, [])],
+                                latency_ms=5)
+
+
+def test_deidentify_strips_names_ids_dates_and_contacts():
+    from clinicalchat.websearch import deidentify
+
+    q = deidentify("Robin Hood (robin-hood-31, MRN 12345678, DOB 01/02/1995) case C-5A0A12FB, hyperkalemia in Robin's "
+                   "CKD, call +91 98765 43210, robin@x.com", ["Robin Hood"])
+    assert "hyperkalemia" in q and "CKD" in q
+    assert not any(t in q.lower() for t in ("robin", "12345678", "1995", "c-5a0a12fb", "98765", "@"))
+    from clinicalchat.websearch import trusted
+    assert trusted("pmc.ncbi.nlm.nih.gov", "guideline") and not trusted("evilnih.gov", "health")
+
+
+def test_patient_general_question_uses_trusted_web_sources_with_links(orch, fake_llm):
+    web = _FakeWeb({"health": [{"title": "Iron deficiency anemia", "url": "https://www.mayoclinic.org/iron",
+                                "content": "Iron-rich foods include red meat, beans and dark leafy greens."}]})
+    orch.web = web
+    ans = next(e for e in orch.run("What foods help with iron deficiency?", _session(Role.PATIENT, own="rahul-mehta-32"))
+               if e.kind == "answer")
+    assert web.queries[0][0] == "health" and "Iron-rich foods" in fake_llm.calls[0]
+    assert "[Iron deficiency anemia](https://www.mayoclinic.org/iron)" in ans.text and "mayoclinic.org" in ans.text
+
+
+def test_clinician_guideline_question_adds_cited_web_evidence_but_plain_questions_do_not(orch, fake_llm):
+    web = _FakeWeb({"guideline": [{"title": "KDIGO hyperkalaemia", "url": "https://kdigo.org/hyperk",
+                                   "content": "Treat K+ above 6.0 mmol/L urgently."}]})
+    orch.web = web
+    s = _session(Role.CLINICIAN, selected="ananya-rao-54")
+    orch.run("Interpret this patient's CBC results.", s)
+    assert not web.queries
+    ans = next(e for e in orch.run("What is the current treatment guideline for her condition?", s) if e.kind == "answer")
+    kind, query = web.queries[0]
+    assert kind == "guideline" and "ananya" not in query.lower() and "rao" not in query.lower()
+    assert "WEB EVIDENCE" in fake_llm.calls[-1] and "Treat K+ above 6.0" in fake_llm.calls[-1]
+    assert "[KDIGO hyperkalaemia](https://kdigo.org/hyperk)" in ans.text
+
+
+def test_unknown_brand_is_looked_up_and_checked_against_allergies(orch):
+    orch.web = _FakeWeb({"drug": [{"title": "Saridon Tablet", "url": "https://www.1mg.com/drugs/saridon",
+                                   "content": "Saridon contains paracetamol, propyphenazone and caffeine."}]})
+    events = orch.run("Is Saridon safe for me?", _session(Role.PATIENT, own="rahul-verma-35"))
+    safety = next(e for e in events if e.kind == "safety").text
+    assert "**Saridon**" in safety and "paracetamol" in safety and "1mg.com" in safety
+    assert "CONTRAINDICATED" in safety or "⚠️" in safety  # rahul-verma-35 is allergic to paracetamol
+
+
+def test_unknown_brand_without_known_ingredients_is_flagged_not_cleared(orch):
+    orch.web = _FakeWeb({"drug": [{"title": "Liv 52 Tablet", "url": "https://www.1mg.com/otc/liv-52",
+                                   "content": "Liv 52 is a herbal product containing Himsra and Kasani extracts."}]})
+    events = orch.run("Can I take Liv 52?", _session(Role.PATIENT, own="rahul-verma-35"))
+    safety = next(e for e in events if e.kind == "safety").text
+    assert "could **not** be checked" in safety and "No allergy or interaction conflict" not in safety

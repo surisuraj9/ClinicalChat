@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeout
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -38,11 +40,31 @@ from clinicalchat.llm import get_chat_model
 from clinicalchat.models import Domain
 from clinicalchat.rbac import AGENT_LABELS, AgentName, Role, policy
 from clinicalchat.risk import PATIENT_GUIDANCE, RiskAssessment, RiskDetectionAgent
+from clinicalchat.websearch import WebSearch, WebSearchOutcome
 from clinicalchat.router import RoutePlan, Router
 from clinicalchat import workflow as wf
 from clinicalchat.store import Store, get_store
 
-HISTORY_TURNS = 2  # short history keeps prompts (and time-to-first-word) small
+HISTORY_TURNS = 2
+GENERIC_WORDS = set("""what which when where does should would could their there this that these those with from about
+have patient patients condition conditions problem problems issue issues findings diagnosis current currently best
+options option next steps step approach plan care give tell explain summary summarize please need needs into
+right based results result report reports labs case history them they""".split())
+WEB_WAIT_PATIENT = 2.5  # seconds a patient's general answer waits for web sources (then answers without them)
+GUIDELINE_ASK = re.compile(
+    r"\b(guidelines?|guidance|evidence|literature|research|stud(?:y|ies)|trials?|latest|recommend\w*|protocols?|"
+    r"first[- ]line|treat\w*|manag\w*|therap\w*|dos(?:e|es|ing)|standard of care|criteria|work[- ]?up|screening)\b", re.I)
+DRUG_CANDIDATE = re.compile(
+    r"\b(?:take|taking|took|use|using|give|giving|prescribed|start(?:ed|ing)?|stop(?:ped|ping)?|tablets? of|syrup)\s+"
+    r"(?:taking |using )?(?:a |an |the |some |one |two |this |my |his |her )?"
+    r"([A-Za-z][A-Za-z0-9-]{2,}(?:[ -](?:\d{2,4}|forte|plus|ds|xr|sr|er|cr|duo|max|mr))?)", re.I)
+DRUG_SAFE_ASK = re.compile(r"\b(?:is|are)\s+([A-Za-z][A-Za-z0-9-]{2,}(?:[ -]\d{2,4})?)\s+(?:safe|ok|okay|fine|allowed)\b", re.I)
+NOT_DRUGS = set("""medicine medicines medication medications tablet tablets pill pills drug drugs capsule capsules it this that
+them these those rest care food foods water alcohol exercise bath shower leave test tests report reports painkiller
+painkillers antibiotic antibiotics something anything vaccine vaccines steps action time walk coffee tea milk sugar
+juice supplement supplements vitamin vitamins iron calcium injection injections blood more less any dose doses course
+diet sleep nap break off over care advice help them treatment surgery holiday day days week weeks it's while place
+fever cold cough pain""".split())  # short history keeps prompts (and time-to-first-word) small
 REVIEW_CONFIDENCE = 0.6
 LEVEL_BADGE = {"LOW": "🟢 LOW", "MODERATE": "🟡 MODERATE", "HIGH": "🟠 HIGH", "CRITICAL": "🔴 CRITICAL"}
 
@@ -103,6 +125,7 @@ class _Run:
     file_case: bool = False  # patient: open/update a care-team case (new evidence or an explicit review request)
     evidence_fp: str = ""  # Insight cache key
     case_fp: str = ""  # what a case covered (for the escalation safety net)
+    web: List[WebSearchOutcome] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -120,6 +143,8 @@ class Orchestrator:
         self.insight = InsightGenerationAgent(self.llm)
         self.communication = PatientCommunicationAgent(self.fast_llm)
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="insight")
+        self.web = WebSearch(engine.settings, self.store)
+        self._web_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="web")
         self._background: List[Future] = []
 
     # ------------------------------------------------------------------ chat question
@@ -142,6 +167,8 @@ class Orchestrator:
             yield Event("blocked", "🔒 Access", plan.blocked)
             return self._finish(session, turn, plan, run, started)
 
+        if plan.mode != "status":
+            yield from self._lookup_unknown_drugs(question, session, plan, run)
         if plan.mode == "status":
             md = self.case_status_markdown(plan.patient_key)
             turn.answers.append({"label": "📁 Case status", "markdown": md, "summary": md[:300]})
@@ -433,13 +460,22 @@ class Orchestrator:
         config = self._config(session)
         label = AGENT_LABELS[AgentName.INSIGHT]
         yield Event("status", f"{label} — writing", "Consolidating the findings (AI)…", "pending", "agent-insight")
-        ins = self._run_insight(question, policy(role).audience, plan, ext, an, risk, session.history_text(), config, run)
+        web = None
+        if GUIDELINE_ASK.search(question):
+            # "guideline for her condition" names no condition -> add the top findings; "…for hyperkalemia" stays as is
+            vague = not (set(re.findall(r"[a-z][a-z-]{3,}", GUIDELINE_ASK.sub(" ", question.lower()))) - GENERIC_WORDS)
+            terms = " ".join(an.possible_conditions[:2]) if vague else ""
+            web = yield from self._web("guideline", f"{question} {terms} clinical guideline", session, run)
+        ins = self._run_insight(question, policy(role).audience, plan, ext, an, risk, session.history_text(), config, run,
+                                web=web)
         out = ins.output or {}
         run.review_reasons = self._review_reasons(ext, an, risk, ins)
         yield Event("status", f"{label} — {'failed' if ins.error else 'done'}", _timing(ins), "done", "agent-insight")
         session.last_insight = {"patient_key": plan.patient_key, "question": question, "output": out,
                                 "risk": risk.risk_level, "facts": an.facts_text()}
         md = render_insight(ins, run.review_reasons, ext.sources)
+        if web and web.results and not ins.error:
+            md += web.links_markdown("🌐 Guideline / evidence sources (web — verify before acting)")
         turn.answers.append({"label": label, "markdown": md, "summary": str(out.get("answer", ins.error))[:300]})
         yield Event("answer", label, md, data={"agent": "insight", "review": run.review_reasons})
         if plan.mode == "explain" and not ins.error:
@@ -509,14 +545,86 @@ class Orchestrator:
             f.result(timeout=timeout)
         self._background.clear()
 
-    def _run_insight(self, question, audience, plan, ext, an, risk, history, config, run) -> AgentResult:
+    def _run_insight(self, question, audience, plan, ext, an, risk, history, config, run,
+                     web: Optional[WebSearchOutcome] = None) -> AgentResult:
+        context = self.engine.records_context(question, ext.sections, ext.focus)
+        if web and web.results:
+            context += ("\n\n## WEB EVIDENCE (trusted guideline sites; cite as [W1], [W2]… for guideline / treatment "
+                        "statements; it never overrides this patient's records)\n" + web.context())
         ins = self.insight.run(question=question, audience=audience, patient=self.engine.patient_summary(plan.patient_key),
                                extraction=self._extraction_brief(ext), facts=an.facts_text(), risk=self._risk_brief(risk),
-                               feedback=self._feedback(), context=self.engine.records_context(question, ext.sections, ext.focus),
-                               history=history, config=config)
+                               feedback=self._feedback(), context=context, history=history, config=config)
         if run is not None:
             run.llm.append(ins)
         return ins
+
+    # ------------------------------------------------------------------ 🌐 web search (Tavily, trusted sites)
+    def _patient_names(self) -> List[str]:
+        return [p.name for p in self.engine.registry.patients.values()]
+
+    def _web(self, kind: str, query: str, session: ChatSession, run: _Run,
+             wait: Optional[float] = None) -> Iterator[Event]:
+        """Search trusted sites; returns the outcome (or None when off / too slow for ``wait`` seconds)."""
+        if not self.web.enabled:
+            return None
+        where = {"health": "WHO, NIH, CDC, NHS, Mayo Clinic…", "guideline": "NICE, NCBI/PubMed, KDIGO, AHA…",
+                 "drug": "DailyMed, MedlinePlus, drugs.com…"}[kind]
+        yield Event("status", "🌐 Web search — trusted sites", f"Searching {where} (no personal details are sent)",
+                    "pending", "web")
+        fut = self._web_pool.submit(self.web.search, query, kind, self._patient_names(), self._config(session))
+        try:
+            out = fut.result(timeout=wait)
+        except FutureTimeout:  # answer now; the search finishes in the background and is cached for next time
+            yield Event("status", "🌐 Web search — skipped", f"Took longer than {wait:.0f}s — answering without it",
+                        "done", "web")
+            return None
+        run.web.append(out)
+        if out.error:
+            text = f"Unavailable ({out.error[:80]})"
+        else:
+            sites = ", ".join(dict.fromkeys(r.domain for r in out.results)) or "nothing relevant"
+            text = f"{len(out.results)} result(s): {sites}" + (" (cached)" if out.cached else f" ({out.latency_ms} ms)")
+        yield Event("status", "🌐 Web search — done", text, "done", "web")
+        return out
+
+    def _drug_candidates(self, question: str, plan: RoutePlan) -> List[str]:
+        kg = self.engine.kg
+        found = []
+        for m in [*DRUG_CANDIDATE.finditer(question), *DRUG_SAFE_ASK.finditer(question)]:
+            cand = m.group(1).strip(" -")
+            head = cand.split()[0].lower()
+            if (head in NOT_DRUGS or kg.resolve_drugs(cand) or kg.resolve_allergen(cand) or kg.symptoms_in_text(cand)
+                    or head in {d.lower() for d in plan.drugs}):
+                continue
+            found.append(cand)
+        return list(dict.fromkeys(found))[:2]
+
+    def _lookup_unknown_drugs(self, question: str, session: ChatSession, plan: RoutePlan, run: _Run) -> Iterator[Event]:
+        """A medicine the knowledge graph does not know (often a brand, e.g. "Dolo 650", "Augmentin"): look up what it
+        contains on trusted drug sites, then run the normal deterministic allergy / interaction checks on those
+        ingredients. The web only *adds* checks — it can never clear a warning."""
+        if not self.web.enabled:
+            return
+        for cand in self._drug_candidates(question, plan):
+            out = yield from self._web("drug", f"{cand} medicine active ingredient generic name", session, run)
+            if out is None:
+                continue
+            head = cand.split()[0].lower()
+            matching = [r for r in out.results if head in f"{r.title} {r.content}".lower()][:3]
+            ingredients = list(dict.fromkeys(d for r in matching for d in self.engine.kg.resolve_drugs(f"{r.title} {r.content}")))[:3]
+            if ingredients:
+                src = matching[0]
+                plan.drugs = list(dict.fromkeys([*plan.drugs, *ingredients]))
+                plan.check_allergies = True
+                if Domain.ALLERGY in policy(session.role).domains and Domain.ALLERGY not in plan.focus:
+                    plan.focus.append(Domain.ALLERGY)
+                plan.drug_notes.append(f"🌐 **{cand}** — according to [{src.domain}]({src.url}) it contains "
+                                       f"**{', '.join(ingredients)}**; checked below. _Web lookup — confirm with a pharmacist._")
+                plan.notes.append(f"Web lookup: {cand} → {', '.join(ingredients)}")
+            elif matching:
+                plan.drug_notes.append(f"🌐 **{cand}** — found on [{matching[0].domain}]({matching[0].url}), but its "
+                                       "ingredients are not in our safety database, so it could **not** be checked against "
+                                       "allergies. Please ask a pharmacist or your doctor before taking it.")
 
     def _write(self, title: str, session: ChatSession, abnormal: bool, **kwargs) -> Iterator[Event]:
         """Run the Communication agent, streaming the answer as it is written. Each partial is passed through the
@@ -675,7 +783,10 @@ class Orchestrator:
             turn.answers.append({"label": label, "markdown": md, "summary": md[:300]})
             yield Event("answer", label, md, data={"agent": "communication", "faq_cache": True})
             return
+        web = yield from self._web("health", question, session, run, wait=WEB_WAIT_PATIENT)
         context, sources = self.engine.reference_context(question)
+        if web and web.results:
+            context += ("\n\n## Trusted health websites (current, public information)\n" + web.context())
         yield Event("status", f"{label} — answering", "Looking up reference information and writing an answer (AI)…",
                     "pending", "agent-communication")
         com = yield from self._write("💬 Writing your answer…", session, False, question=question,
@@ -689,6 +800,8 @@ class Orchestrator:
             md = communication_markdown(com.output or {})
             md += "\n\n<sub>ℹ️ General health information, not personal medical advice."
             md += f" Sources: {', '.join(sources)}</sub>" if sources else "</sub>"
+            if web and web.results:
+                md += web.links_markdown("🌐 From trusted health sites")
             if com.parsed and not any(k in i for i in check_patient_text([md], False) for k in BLOCKING_GUARD):
                 self.store.faq_save(question, allergies, md)
         turn.answers.append({"label": label, "markdown": md, "summary": md[:300]})
@@ -848,7 +961,7 @@ class Orchestrator:
 
     def safety_banner(self, plan: RoutePlan) -> str:
         p = self.engine.patient(plan.patient_key)
-        lines = []
+        lines = list(plan.drug_notes)
         alerts = self.engine.safety_alerts(plan.patient_key, plan.drugs)
         for a in alerts:
             icon = "⛔" if a.level == "CONTRAINDICATED" else "⚠️"
@@ -876,6 +989,7 @@ class Orchestrator:
             "llm_calls": sum(1 for r in run.llm if not r.cache_hit and not r.error),
             "cache_hits": sum(1 for r in run.llm if r.cache_hit),
             "errors": [r.error for r in run.llm if r.error],
+            "web_searches": [w.audit() for w in run.web],
             "latency_ms": int((time.perf_counter() - started) * 1000),
         })
 
