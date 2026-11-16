@@ -145,6 +145,20 @@ class ClinicalVectorStore:
             self.sections[s.section_id] = s
         return self._add([doc])
 
+    def purge_uploads(self, patient_key: str) -> int:
+        """Delete a patient's *uploaded* chunks (dataset chunks are never touched). Returns chunks removed."""
+        collection = self.collection or self.client.get_collection(self.collection_name,
+                                                                   embedding_function=self.embedding_function)
+        where = {"$and": [{"patient_key": patient_key}, {"origin": "upload"}]}
+        ids = collection.get(where=where, include=[])["ids"]
+        if ids:
+            collection.delete(ids=ids)
+        gone = {d for d, doc in self.documents.items()
+                if doc.origin == "upload" and any(sec.patient_key == patient_key for sec in doc.sections)}
+        self.documents = {d: doc for d, doc in self.documents.items() if d not in gone}
+        self.sections = {k: v for k, v in self.sections.items() if v.doc_id not in gone}
+        return len(ids)
+
     def document_of(self, section: Section) -> Optional[ClinicalDocument]:
         return self.documents.get(section.doc_id)
 

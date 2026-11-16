@@ -425,3 +425,23 @@ def test_dose_guard_allows_lab_ranges_but_blocks_doses():
     assert dose not in check_patient_text(["Normal is 12 to 15 g/dL; fasting glucose under 100 mg/dL. Ask your doctor."], False)
     assert dose in check_patient_text(["Take 500 mg twice daily."], False)
     assert dose in check_patient_text(["The usual amount is 5 mg/kg."], False)
+
+
+def test_reset_patient_removes_uploads_cases_and_index_but_keeps_login(orch, engine, store, tmp_path):
+    key = engine.new_patient_key("Reset Me", 40)
+    store.create_user("reset.me", "pw123456", "Reset Me", key, 40, "M")
+    engine.create_patient(key, "Reset Me", 40, "M")
+    cbc = tmp_path / "cbc.txt"
+    cbc.write_text("Complete Blood Count\nPatient Name: Reset Me\nHemoglobin 8.9 g/dL 13.0-17.0\nWBC 16000 /uL 4000-11000\n")
+    list(orch.upload_many([(cbc, "cbc.txt")], _session(Role.PATIENT, own=key, username="reset.me"), message="I feel tired"))
+    orch.drain()
+    assert store.uploads(key) and store.cases(patient_key=key)
+    vs = engine.store
+    assert vs.collection.get(where={"patient_key": key}, include=[])["ids"]
+    dataset_chunks = vs.collection.count() - len(vs.collection.get(where={"patient_key": key}, include=[])["ids"])
+
+    removed = store.purge_patient(key)
+    assert removed["uploads"] == 1 and removed["cases"] == 1 and "users" not in removed
+    assert vs.purge_uploads(key) > 0 and vs.collection.count() == dataset_chunks
+    assert not store.uploads(key) and not store.cases(patient_key=key) and store.get_user("reset.me")
+    assert not any(s.patient_key == key for s in vs.sections.values())

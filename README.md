@@ -167,6 +167,16 @@ Tests use a fake LLM, so they make no real calls:
 .venv/bin/python -m pytest
 ```
 
+### Reset a patient (for re-testing)
+
+```bash
+# stop the server first (it keeps patient data in memory)
+clinicalchat reset-patient robin.hood            # username or patient key; asks for confirmation
+clinicalchat reset-patient robin.hood --delete-login --yes
+```
+
+This removes the patient's uploads, search-index chunks, symptoms/allergies, cases and their review history, the cached insight and chat exports. Dataset records and other patients are not touched. The JSONL audit log is append-only and is kept.
+
 ## Docker
 
 ```bash

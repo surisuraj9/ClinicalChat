@@ -244,6 +244,19 @@ class Store:
         return sorted({d for c in self.cases(patient_key=patient_key)
                        for d in (c["payload"].get("radiology") or {}).get("doc_ids", [])})
 
+    def purge_patient(self, patient_key: str, delete_login: bool = False) -> Dict[str, int]:
+        """Remove everything stored for a patient (uploads, facts, cases + their review history, cached insight).
+        The login is kept unless ``delete_login``. Returns the number of rows removed per table."""
+        removed: Dict[str, int] = {}
+        with self._lock, self._conn() as c:
+            removed["feedback"] = c.execute(
+                "DELETE FROM feedback WHERE case_id IN (SELECT case_id FROM cases WHERE patient_key=?)", (patient_key,)).rowcount
+            for table in ("cases", "uploads", "profile_facts", "insights"):
+                removed[table] = c.execute(f"DELETE FROM {table} WHERE patient_key=?", (patient_key,)).rowcount
+            if delete_login:
+                removed["users"] = c.execute("DELETE FROM users WHERE patient_key=?", (patient_key,)).rowcount
+        return removed
+
     def consolidate_open_cases(self) -> int:
         """One-time tidy-up: older duplicate open cases of a patient are merged into the newest one."""
         merged = 0
