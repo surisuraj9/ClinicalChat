@@ -1,0 +1,27 @@
+flowchart LR
+    P([🧑 Patient]):::person
+    C([👩‍⚕️ Clinician]):::person
+    R([🩻 Radiologist]):::person
+    K([🧭 Care coordinator]):::person
+    subgraph APP["ClinicalChat (one Python process)"]
+        UI["Web UI<br/>FastAPI + Gradio"]
+        SVC["Services + 5 agents"]
+        KB["Knowledge base in memory<br/>catalog · patients · knowledge graph"]
+    end
+    DB[("SQLite<br/>users · cases · uploads · caches")]
+    VEC[("ChromaDB<br/>report passages")]
+    FILES[/"Dataset files<br/>DOCX · PDF · XLSX"/]
+    AUD[/"Audit log<br/>JSONL"/]
+    OAI{{"OpenAI<br/>gpt-4.1 / gpt-4.1-mini"}}
+    TAV{{"Tavily<br/>trusted sites only"}}
+    LF{{"Langfuse<br/>traces"}}
+    P & C & R & K --> UI
+    UI --> SVC --> KB
+    SVC --> DB
+    KB --> VEC
+    FILES --> KB
+    SVC --> AUD
+    SVC -->|"2 AI agents"| OAI
+    SVC -->|"de-identified queries"| TAV
+    SVC -.->|"spans"| LF
+    classDef person fill:#eef2ff,stroke:#4338ca

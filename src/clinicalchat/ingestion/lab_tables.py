@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, List, Optional, Tuple
 
-from clinicalchat.models import LabResult, LabStatus
+from clinicalchat.domain.models import LabResult, LabStatus
 
 _NUM = r"\d+(?:\.\d+)?"
 _RANGE_RE = re.compile(rf"({_NUM})\s*(?:-|–|—|~|to)\s*({_NUM})", re.IGNORECASE)
@@ -111,7 +111,34 @@ def _find_header(rows: List[List[str]]) -> Optional[int]:
     return None
 
 
+def _read_cells(row: List[str], status_col: Optional[int]) -> Tuple[Optional[float], str, str, Optional[float],
+                                                                     Optional[float], str]:
+    """First numeric cell = the value (+ unit), first range-like cell = the reference range."""
+    value, value_text, unit = None, "", ""
+    low = high = None
+    range_text = ""
+    for i, cell in enumerate(row[1:], start=1):
+        if i == status_col:
+            continue
+        if value is None:
+            v, rest = parse_value(cell)
+            if v is not None and not _RANGE_RE.search(_strip_thousands(cell)):
+                value, value_text, unit = v, cell, rest
+                continue
+        if not range_text:
+            lo, hi, trailing = parse_reference_range(cell)
+            if lo is not None or hi is not None:
+                low, high, range_text = lo, hi, cell.replace("|", " ").strip()
+                unit = unit or trailing
+    return value, value_text, unit, low, high, range_text
+
+
+def _cell(row: List[str], col: Optional[int]) -> str:
+    return row[col] if col is not None and col < len(row) else ""
+
+
 def parse_lab_table(rows: List[List[str]]) -> List[LabResult]:
+    """A report table with a value column and a reference-range column -> one LabResult per test row."""
     header_idx = _find_header(rows)
     if header_idx is None:
         return []
@@ -126,39 +153,16 @@ def parse_lab_table(rows: List[List[str]]) -> List[LabResult]:
         param = row[0]
         if param.lower() in {"investigations", "parameter", "test", "result"} or parse_value(param)[0] is not None:
             continue
-        value = None
-        value_text = ""
-        unit = ""
-        low = high = None
-        range_text = ""
-        for i, cell in enumerate(row[1:], start=1):
-            if i == status_col:
-                continue
-            if value is None:
-                v, rest = parse_value(cell)
-                if v is not None and not _RANGE_RE.search(_strip_thousands(cell)):
-                    value, value_text, unit = v, cell, rest
-                    continue
-            if not range_text:
-                lo, hi, trailing = parse_reference_range(cell)
-                if lo is not None or hi is not None:
-                    low, high, range_text = lo, hi, cell.replace("|", " ").strip()
-                    unit = unit or trailing
+        value, value_text, unit, low, high, range_text = _read_cells(row, status_col)
         if value is None:
             continue
-        if unit_col is not None and unit_col < len(row) and not unit:
-            unit = row[unit_col]
-        if not value_text:
-            value_text = row[1]
-        reported = row[status_col] if status_col is not None and status_col < len(row) else ""
+        unit = unit or _cell(row, unit_col)
+        reported = _cell(row, status_col)
         status = compute_status(param, value, low, high)
-        results.append(
-            LabResult(
-                parameter=param, value_text=value_text, value=value, unit=unit.strip(" |"),
-                reference_range=range_text, ref_low=low, ref_high=high, status=status,
-                reported_status=reported, status_discrepancy=not _reported_matches(reported, status),
-            )
-        )
+        results.append(LabResult(
+            parameter=param, value_text=value_text or row[1], value=value, unit=unit.strip(" |"),
+            reference_range=range_text, ref_low=low, ref_high=high, status=status,
+            reported_status=reported, status_discrepancy=not _reported_matches(reported, status)))
     return results
 
 

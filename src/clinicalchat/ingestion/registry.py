@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterable, List, Optional
 
-from clinicalchat.models import AllergyRecord, ClinicalDocument, Domain, PatientProfile, Section
+from clinicalchat.domain.models import AllergyRecord, ClinicalDocument, Domain, PatientProfile, Section
 
 _NONE_WORDS = {"none", "nil", "n/a", "na", "not applicable", "no", "negative", "not required",
                "no symptoms", "never reported", "none identified", "-", "–"}
@@ -28,7 +28,6 @@ _MED_SECTION_HEADERS = ("discharge medications", "medications", "current medicat
                         "medications used", "emergency medication prescribed")
 
 
-INTAKE_SOURCE = "Patient intake"
 
 
 def patient_key(name: str, age: Optional[int]) -> str:
@@ -70,30 +69,30 @@ def allergen_for(doc: ClinicalDocument) -> tuple[str, str]:
     return doc.title.lower(), "Unknown"
 
 
+def _is_positive(section: Section, severity_text: str, reactions: str) -> bool:
+    """The title decides when it says normal / abnormal; else a stated severity or reaction; else an abnormal specific IgE."""
+    title = section.title.lower()
+    if "abnormal" in title or "positive" in title:
+        return True
+    if "normal" in title:
+        return False
+    if (severity_text and not is_none(severity_text)) or (reactions and not is_none(reactions)):
+        return True
+    return any(r.abnormal and "ige" in r.parameter.lower() and "total" not in r.parameter.lower()
+               for r in section.lab_results)
+
+
 def extract_allergy(doc: ClinicalDocument, section: Section) -> Optional[AllergyRecord]:
     """Return an AllergyRecord when the section documents a *positive* allergy, else None."""
     allergen, category = allergen_for(doc)
     f = section.fields
-    title = section.title.lower()
     severity_text = _first(f, "Reaction Severity", "Severity Level", "Severity")
     reactions = _first(f, "Symptoms", "Reaction Type", "Rash Type", "Rash", "Reaction")
     specific_agent = _first(f, "Allergen / Contact Agent", "Allergen", "Contact Agent")
     if category == "Skin" and specific_agent and not is_none(specific_agent):
         allergen = specific_agent
 
-    positive = False
-    if "abnormal" in title or "positive" in title:
-        positive = True
-    elif "normal" in title:
-        positive = False
-    elif severity_text and not is_none(severity_text):
-        positive = True
-    elif reactions and not is_none(reactions):
-        positive = True
-    else:
-        positive = any(r.abnormal and "ige" in r.parameter.lower() and "total" not in r.parameter.lower()
-                       for r in section.lab_results)
-    if not positive:
+    if not _is_positive(section, severity_text, reactions):
         return None
 
     severity = normalise_severity(severity_text or reactions or "")
@@ -192,16 +191,6 @@ class PatientRegistry:
                     profile.conditions.append(cond)
             profile.abnormal_labs.extend(r for r in section.lab_results if r.abnormal and doc.domain == Domain.LAB)
         return touched
-
-    def upsert_patient(self, name: str, age: Optional[int] = None, gender: Optional[str] = None,
-                       patient_key_hint: Optional[str] = None) -> str:
-        """Create (or update demographics of) a patient, e.g. from intake or an upload for a new patient."""
-        if patient_key_hint and patient_key_hint in self.patients:
-            profile = self.patients[patient_key_hint]
-            profile.age = profile.age if profile.age is not None else age
-            profile.gender = profile.gender or gender
-            return patient_key_hint
-        return self.register(name.strip(), age, gender, [])
 
     def register(self, name: str, age: Optional[int], gender: Optional[str], identifiers: List[str]) -> str:
         key = patient_key(name, age)

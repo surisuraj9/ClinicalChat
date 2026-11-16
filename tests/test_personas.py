@@ -1,42 +1,38 @@
 import pytest
 
-from clinicalchat import engine as engine_mod
-from clinicalchat import store as store_mod
-from clinicalchat.personas import PERSONAS, authenticate, get_persona, signup
-from clinicalchat.rbac import Role
+from clinicalchat.domain.personas import PERSONAS
+from clinicalchat.domain.roles import Role
 
 
 @pytest.fixture()
-def isolated(engine, store, monkeypatch):
-    monkeypatch.setattr(store_mod, "_STORE", store)
-    monkeypatch.setattr(engine_mod, "_ENGINE", engine)
-    return store
+def accounts(container):
+    return container.accounts
 
 
-def test_one_persona_per_role_and_patients_bound(engine):
+def test_one_persona_per_role_and_patients_bound(kb):
     assert {p.role for p in PERSONAS.values()} == set(Role)
     for p in PERSONAS.values():
         if p.role == Role.PATIENT:
-            assert engine.patient(p.patient_key) is not None
+            assert kb.patients.get(p.patient_key) is not None
 
 
-def test_authenticate_demo(isolated):
-    assert authenticate("dr.sharma", "demo@123")
-    assert not authenticate("dr.sharma", "wrong")
-    assert not authenticate("nobody", "demo@123")
+def test_authenticate_demo(accounts):
+    assert accounts.authenticate("dr.sharma", "demo@123")
+    assert not accounts.authenticate("dr.sharma", "wrong")
+    assert not accounts.authenticate("nobody", "demo@123")
 
 
-def test_signup_creates_private_patient_record(isolated, engine):
-    ok, key = signup("ananya.new", "s3cret-pass", "s3cret-pass", "ananya rao", "54", "Female", "penicillin", "metformin")
+def test_signup_creates_private_patient_record(accounts, repos, kb):
+    ok, key = accounts.signup("ananya.new", "s3cret-pass", "s3cret-pass", "ananya rao", "54", "Female", "penicillin", "metformin")
     assert ok
     assert key != "ananya-rao-54"  # never merged into the existing patient with the same name
-    p = engine.patient(key)
+    p = kb.patients.get(key)
     assert p.name == "Ananya Rao" and not p.section_ids
     assert [a.allergen for a in p.allergies] and "metformin" in p.medications
-    assert authenticate("ananya.new", "s3cret-pass") and not authenticate("ananya.new", "wrong-pass")
-    persona = get_persona("ananya.new")
+    assert accounts.authenticate("ananya.new", "s3cret-pass") and not accounts.authenticate("ananya.new", "wrong-pass")
+    persona = accounts.get_persona("ananya.new")
     assert persona.role == Role.PATIENT and persona.patient_key == key
-    assert isolated.get_user("ananya.new")["pw_hash"] != "s3cret-pass"  # hashed
+    assert repos.users.get("ananya.new")["pw_hash"] != "s3cret-pass"  # hashed
 
 
 @pytest.mark.parametrize("args,msg", [
@@ -46,6 +42,6 @@ def test_signup_creates_private_patient_record(isolated, engine):
     (("new.user", "password1", "password2", "X Y", "30", ""), "do not match"),
     (("new.user", "password1", "password1", "X Y", "abc", ""), "valid age"),
 ])
-def test_signup_validation(isolated, args, msg):
-    ok, err = signup(*args)
+def test_signup_validation(accounts, args, msg):
+    ok, err = accounts.signup(*args)
     assert not ok and msg in err

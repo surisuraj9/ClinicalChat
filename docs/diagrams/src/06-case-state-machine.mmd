@@ -1,0 +1,12 @@
+stateDiagram-v2
+    [*] --> AWAITING_RADIOLOGY: case opened, unread scans
+    [*] --> AWAITING_TRIAGE: case opened, no scans
+    AWAITING_RADIOLOGY --> AWAITING_TRIAGE: radiologist submits read
+    AWAITING_TRIAGE --> PENDING_REVIEW: coordinator sets priority + assigns clinician
+    PENDING_REVIEW --> VALIDATED: clinician approves (message sent to patient)
+    PENDING_REVIEW --> RETURNED: clinician asks for more info
+    RETURNED --> PENDING_REVIEW: patient replies (same clinician)
+    RETURNED --> AWAITING_RADIOLOGY: patient adds a new scan
+    AWAITING_TRIAGE --> MERGED: older duplicate open case (any open stage) folded into newest
+    VALIDATED --> [*]
+    MERGED --> [*]

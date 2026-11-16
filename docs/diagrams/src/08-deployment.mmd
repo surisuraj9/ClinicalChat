@@ -1,0 +1,14 @@
+flowchart LR
+    U([Browser]) -->|"HTTPS"| ALB["AWS load balancer / HTTPS"]
+    subgraph AWS["AWS (planned)"]
+        ALB --> APP["Container: clinicalchat serve<br/>port 7860, /health check"]
+        APP --- VOL[("Persistent volume<br/>data/state · chroma · audit · exports")]
+        SEC["Secrets: OPENAI · TAVILY · LANGFUSE keys"] -.-> APP
+    end
+    APP -->|"HTTPS"| OAI{{"OpenAI API"}}
+    APP -->|"HTTPS"| TAV{{"Tavily API"}}
+    APP -.->|"HTTPS"| LF{{"Langfuse"}}
+    subgraph BUILD["Docker image build"]
+        SRC["src + data/raw"] --> ING["clinicalchat ingest<br/>(parse dataset + vector index)"]
+    end
+    ING -.-> APP

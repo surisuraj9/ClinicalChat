@@ -1,0 +1,16 @@
+flowchart TB
+    A["📎 Attach up to 10 files + optional message"] --> B["UploadService.upload_many"]
+    B --> C{"Patient may upload?<br/>message about another patient?"}
+    C -->|"no"| X["🔒 Refused"]
+    C -->|"yes"| D["Read files in parallel (4 workers)<br/>DOCX · PDF · XLSX · TXT · image"]
+    D --> E["Scanned page? → OCR (RapidOCR)"]
+    E --> F["Split into sections, find lab values,<br/>classify: lab / radiology / allergy"]
+    F --> G{"Already on record?<br/>name on report = this patient?"}
+    G -->|"duplicate / other name"| Y["⚠️ File skipped, others continue"]
+    G -->|"ok"| Q["Quality score<br/>(low = flagged for clinician)"]
+    Q --> H["Save upload (SQLite) +<br/>add to knowledge base (catalog, graph, ChromaDB)"]
+    H --> I["ONE pipeline run for all files + message:<br/>extraction → analysis → risk"]
+    I --> J["PatientResponder: answer + open/update case"]
+    J --> K{"Unread imaging?"}
+    K -->|"yes"| L["🩻 Radiologist queue"]
+    K -->|"no"| M["🧭 Coordinator queue"]

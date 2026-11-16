@@ -1,0 +1,27 @@
+sequenceDiagram
+    autonumber
+    actor P as Patient
+    participant UI as web/controller
+    participant CH as ChatService
+    participant RT as Router
+    participant PL as AnalysisPipeline
+    participant PR as PatientResponder
+    participant CF as CaseFiler
+    participant CO as Communicator
+    participant AI as OpenAI
+    participant BG as InsightService
+    P->>UI: "I have fever and cough since 3 days"
+    UI->>CH: ask(question, session)
+    CH->>RT: route()
+    RT-->>CH: plan: mode=case, symptoms=[fever, cough]
+    CH->>PL: run(ctx): extraction, analysis, risk
+    PL-->>UI: quick check + risk guidance (instant)
+    CH->>PR: respond(ctx)
+    PR->>CF: needs_case? (new symptoms: yes)
+    PR->>CO: communicate(rule-based findings)
+    CO->>AI: one streamed call (fast model)
+    AI-->>UI: words appear as they stream
+    CO->>CF: file case (open or update the ONE case)
+    CF-->>UI: "Case C-… created, with care coordinator"
+    PR->>BG: write Insight in the background
+    BG->>AI: one call (strong model), saved on the case

@@ -18,7 +18,6 @@ log = logging.getLogger(__name__)
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-UPLOAD_SUFFIXES = {".docx", ".pdf", ".xlsx", ".txt", ".md", *IMAGE_SUFFIXES}
 
 
 @dataclass
@@ -69,8 +68,6 @@ def load_docx(path: Path) -> List[Block]:
 
 def _ocr_page_rows(image) -> List[List[str]]:
     """OCR a rendered page and regroup detected text boxes into visual rows."""
-    from rapidocr_onnxruntime import RapidOCR
-
     engine = _ocr_engine()
     result, _ = engine(image)
     if not result:

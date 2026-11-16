@@ -1,0 +1,30 @@
+flowchart LR
+    subgraph INFRA["Infrastructure (created first)"]
+        DB[("Database")] --> REPOS["Repositories<br/>users · facts · uploads · cases · feedback · caches"]
+        LLM["OpenAI models<br/>strong + fast"]
+        WEBS["TavilySearch"]
+        TR["Tracer · AuditLog"]
+    end
+    KB["KnowledgeBase<br/>catalog · patients · graph · index · records · safety"]
+    subgraph AGENTS["Agents"]
+        EX["DataExtraction"] 
+        AN["ClinicalAnalysis"]
+        RI["RiskDetection"]
+        IG["InsightGeneration"]
+        PC["PatientCommunication"]
+    end
+    subgraph SERVICES["Services (use cases)"]
+        CHAT["ChatService"]
+        UP["UploadService"]
+        CT["CareTeamService"]
+        ACC["AccountService"]
+        ADM["PatientDataAdmin"]
+    end
+    KB --> EX & AN
+    LLM --> IG & PC
+    EX & AN & RI --> PIPE["AnalysisPipeline"]
+    IG --> INS["InsightService"]
+    PC --> AW["AnswerWriter"]
+    PIPE & INS & AW & WEBS --> CHAT & UP
+    REPOS --> CT & ACC & ADM & CHAT
+    TR --> CHAT

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "clinicalchat"
 version = "0.1.0"
-description = "ClinicalChat — a simple role-aware multi-agent clinical chatbot (Lab, Radiology, Allergy, Care Coordinator)"
+description = "ClinicalChat — role-aware 5-agent clinical assistant (extraction, analysis, risk, insight, communication)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -40,4 +40,4 @@ addopts = "-q -m 'not live'"
 markers = ["live: calls a real LLM provider (deselect with -m 'not live')"]
 
 [tool.setuptools.package-data]
-clinicalchat = ["assets/*.svg"]
+clinicalchat = ["web/assets/*.svg"]

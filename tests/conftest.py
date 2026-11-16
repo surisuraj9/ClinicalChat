@@ -12,11 +12,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from clinicalchat.audit import Auditor
-from clinicalchat.config import Settings
-from clinicalchat.engine import ClinicalEngine
-from clinicalchat.orchestrator import Orchestrator
-from clinicalchat.store import Store
+from clinicalchat.config import Settings, get_settings
+from clinicalchat.container import build_container
+from clinicalchat.services.knowledge_base import KnowledgeBase
 
 
 class FakeLLM(BaseChatModel):
@@ -42,9 +40,17 @@ class FakeLLM(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content="```json\n" + json.dumps(payload) + "\n```"))])
 
 
+class NoWeb:
+    """Web search switched off (tests never call Tavily)."""
+    enabled = False
+
+    def search(self, query, kind, names=(), config=None):  # pragma: no cover - never called when disabled
+        raise AssertionError("web search is off in tests")
+
+
 @pytest.fixture(scope="session")
-def engine():
-    return ClinicalEngine(persist=False)
+def kb():
+    return KnowledgeBase.load(get_settings(), persist=False)
 
 
 @pytest.fixture()
@@ -53,10 +59,20 @@ def fake_llm():
 
 
 @pytest.fixture()
-def store(tmp_path):
-    return Store(path=tmp_path / "test.db")
+def make_container(kb, tmp_path):
+    """Builds the app with a fake model, a fake web search and a throw-away database / audit folder."""
+    def make(llm=None, web=None):
+        settings = Settings(work_dir=tmp_path)
+        return build_container(settings, kb=kb, llm=llm or FakeLLM(cache=False, calls=[]), web=web or NoWeb(),
+                               db_path=tmp_path / "test.db", persist=False)
+    return make
 
 
 @pytest.fixture()
-def orch(engine, fake_llm, store, tmp_path):
-    return Orchestrator(engine, llm=fake_llm, auditor=Auditor(Settings(work_dir=tmp_path)), store=store)
+def container(make_container, fake_llm):
+    return make_container(llm=fake_llm)
+
+
+@pytest.fixture()
+def repos(container):
+    return container.repos

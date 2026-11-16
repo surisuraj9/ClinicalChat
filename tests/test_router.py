@@ -1,8 +1,8 @@
 import pytest
 
-from clinicalchat.models import Domain
-from clinicalchat.rbac import AgentName as A
-from clinicalchat.router import Router
+from clinicalchat.domain.models import Domain
+from clinicalchat.domain.roles import AgentName as A
+from clinicalchat.services.router import Router
 
 STAFF_PIPELINE = [A.EXTRACTION, A.ANALYSIS, A.RISK, A.INSIGHT]
 FULL_PIPELINE = [*STAFF_PIPELINE, A.COMMUNICATION]
@@ -21,8 +21,8 @@ CASES = [
 
 
 @pytest.mark.parametrize("question,role,selected,own,focus", CASES)
-def test_problem_statement_queries(engine, question, role, selected, own, focus):
-    plan = Router(engine).route(question, role, session_patient=selected, own_patient=own)
+def test_problem_statement_queries(kb, question, role, selected, own, focus):
+    plan = Router(kb.patients, kb.kg).route(question, role, session_patient=selected, own_patient=own)
     assert not plan.blocked
     assert plan.focus == focus
     assert plan.patient_key == (own or selected)
@@ -30,40 +30,40 @@ def test_problem_statement_queries(engine, question, role, selected, own, focus)
         or plan.mode == "general"
 
 
-def test_patient_personal_question_is_a_case_general_question_is_not(engine):
-    r = Router(engine)
+def test_patient_personal_question_is_a_case_general_question_is_not(kb):
+    r = Router(kb.patients, kb.kg)
     assert r.route("I have fever and cough since 3 days", "patient", own_patient="rahul-mehta-32").mode == "case"
     general = r.route("What is HbA1c?", "patient", own_patient="rahul-mehta-32")
     assert general.mode == "general" and general.agents == [A.COMMUNICATION]
 
 
-def test_symptoms_detected_with_synonyms_and_negation(engine):
-    plan = Router(engine).route("I've been throwing up and have a temperature, no cough", "patient", own_patient="rahul-mehta-32")
+def test_symptoms_detected_with_synonyms_and_negation(kb):
+    plan = Router(kb.patients, kb.kg).route("I've been throwing up and have a temperature, no cough", "patient", own_patient="rahul-mehta-32")
     assert "vomiting" in plan.symptoms and "fever" in plan.symptoms and "cough" not in plan.symptoms
 
 
-def test_patient_cannot_ask_about_someone_else(engine):
-    plan = Router(engine).route("Show Ananya Rao's CBC", "patient", own_patient="rahul-mehta-32")
+def test_patient_cannot_ask_about_someone_else(kb):
+    plan = Router(kb.patients, kb.kg).route("Show Ananya Rao's CBC", "patient", own_patient="rahul-mehta-32")
     assert plan.blocked and not plan.agents
 
 
-def test_radiologist_cannot_open_lab_records(engine):
-    plan = Router(engine).route("Interpret the CBC", "radiologist", session_patient="rahul-mehta-32")
+def test_radiologist_cannot_open_lab_records(kb):
+    plan = Router(kb.patients, kb.kg).route("Interpret the CBC", "radiologist", session_patient="rahul-mehta-32")
     assert plan.blocked and plan.denied_domains == [Domain.LAB]
 
 
-def test_partial_denial_is_noted_not_blocked(engine):
-    plan = Router(engine).route("Compare the CBC with the chest CT", "radiologist", session_patient="meera-nair-47")
+def test_partial_denial_is_noted_not_blocked(kb):
+    plan = Router(kb.patients, kb.kg).route("Compare the CBC with the chest CT", "radiologist", session_patient="meera-nair-47")
     assert not plan.blocked and plan.focus == [Domain.RADIOLOGY] and plan.denied_domains == [Domain.LAB]
 
 
-def test_staff_can_name_patient_in_question(engine):
-    plan = Router(engine).route("Review Meera Nair's CT chest", "radiologist")
+def test_staff_can_name_patient_in_question(kb):
+    plan = Router(kb.patients, kb.kg).route("Review Meera Nair's CT chest", "radiologist")
     assert plan.patient_key == "meera-nair-47" and plan.patient_source == "question"
 
 
-def test_clinician_explain_reuses_last_insight(engine):
-    r = Router(engine)
+def test_clinician_explain_reuses_last_insight(kb):
+    r = Router(kb.patients, kb.kg)
     plan = r.route("Explain this to the patient in simple terms", "clinician", session_patient="ananya-rao-54",
                    has_last_insight=True)
     assert plan.mode == "explain" and plan.agents == [A.COMMUNICATION]
@@ -71,11 +71,11 @@ def test_clinician_explain_reuses_last_insight(engine):
     assert fresh.agents == FULL_PIPELINE
 
 
-def test_coordinator_has_no_patient_communication(engine):
-    plan = Router(engine).route("Explain this to the patient", "coordinator", session_patient="john-doe-54")
+def test_coordinator_has_no_patient_communication(kb):
+    plan = Router(kb.patients, kb.kg).route("Explain this to the patient", "coordinator", session_patient="john-doe-54")
     assert plan.mode == "case" and A.COMMUNICATION not in plan.agents
 
 
-def test_drug_question_checks_allergies(engine):
-    plan = Router(engine).route("Is it safe for me to take ibuprofen?", "patient", own_patient="rahul-mehta-32")
+def test_drug_question_checks_allergies(kb):
+    plan = Router(kb.patients, kb.kg).route("Is it safe for me to take ibuprofen?", "patient", own_patient="rahul-mehta-32")
     assert plan.drugs == ["ibuprofen"] and Domain.ALLERGY in plan.focus and plan.check_allergies

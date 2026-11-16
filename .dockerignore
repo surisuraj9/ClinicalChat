@@ -1,6 +1,5 @@
 .venv
 .git
-.copilot-llm-home
 logs
 data/processed
 data/chroma

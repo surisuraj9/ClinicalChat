@@ -1,0 +1,24 @@
+flowchart LR
+    Q["Question / uploaded reports"] --> RT{"🧭 Router<br/>keywords + RBAC<br/>(no AI)"}
+    RT -->|"case"| E
+    RT -->|"general"| W["🌐 Tavily + reference docs"] --> CM
+    RT -->|"status"| ST["📁 Case status<br/>(no AI)"]
+    subgraph RULES["Rule-based steps · milliseconds · no AI"]
+        E["📄 1 Data Extraction<br/>pick records, quality score"]
+        A["🔬 2 Clinical Analysis"]
+        RK["🚨 3 Risk Detection<br/>LOW → CRITICAL"]
+        E --> A --> RK
+    end
+    subgraph SPEC["Specialists inside step 2"]
+        L["🧪 Lab interpreter"]
+        RA["🩻 Radiology analyzer"]
+        AL["⚠️ Allergy safety<br/>knowledge graph"]
+        SY["🤒 Symptom reasoner"]
+    end
+    A -.-> L & RA & AL & SY
+    RK -->|"staff"| IN["💡 4 Insight Generation<br/>AI · gpt-4.1"]
+    RK -->|"patient"| CM["💬 5 Patient Communication<br/>AI · gpt-4.1-mini, streamed"]
+    CM --> G["🛡️ Guard<br/>no doses, no definitive diagnosis"]
+    G --> OUT["Answer in chat"]
+    IN --> OUT
+    CM -.->|"case opened"| BG["💡 Insight in background<br/>for the care team"]

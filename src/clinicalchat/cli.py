@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import socket
 import sys
 
 
-def main(argv=None) -> int:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="clinicalchat", description="Role-aware multi-agent clinical chatbot")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve", help="Run the web app (login + chat)")
@@ -22,84 +23,98 @@ def main(argv=None) -> int:
     reset.add_argument("patient", help="Patient key (e.g. robin-hood-31) or the patient's login username")
     reset.add_argument("--delete-login", action="store_true", help="Also delete the patient's login")
     reset.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = _parser().parse_args(argv)
     logging.basicConfig(level=logging.WARNING)
+    return {"serve": _serve, "ingest": _ingest, "ask": _ask, "reset-patient": _reset_patient}[args.cmd](args)
 
-    if args.cmd == "serve":
-        from clinicalchat.app import serve
 
-        serve()
-        return 0
-    if args.cmd == "ingest":
-        from clinicalchat.config import get_settings
-        from clinicalchat.engine import ClinicalEngine
-        from clinicalchat.ingestion.pipeline import corpus_stats, load_corpus
+def _serve(_args) -> int:
+    from clinicalchat.web.app import serve
 
-        settings = get_settings()
-        docs, registry = load_corpus(settings, rebuild=args.rebuild)
-        engine = ClinicalEngine(settings, docs, registry)
-        if args.rebuild:
-            engine.store.index(docs, force=True)
-        print(json.dumps({**corpus_stats(docs, registry), "chunks": engine.store.count(),
-                          "embedding": engine.store.embedding_name, "graph": engine.kg.stats()}, indent=2))
-        return 0
-    if args.cmd == "ask":
-        from clinicalchat.engine import get_engine
-        from clinicalchat.orchestrator import ChatSession, Orchestrator
-        from clinicalchat.personas import get_persona
+    serve()
+    return 0
 
-        persona = get_persona(args.user)
-        if not persona:
-            print(f"Unknown user {args.user}", file=sys.stderr)
-            return 2
-        session = ChatSession(username=persona.username, role=persona.role, display_name=persona.display_name,
-                              own_patient=persona.patient_key, selected_patient=persona.patient_key or args.patient)
-        for ev in Orchestrator(get_engine()).ask(args.question, session):
-            if ev.kind == "status":
-                print(f"[{'..' if ev.status == 'pending' else 'ok'}] {ev.title}: {ev.text}", file=sys.stderr)
-            else:
-                print(f"\n=== {ev.title} ===\n{ev.text}")
-        return 0
-    if args.cmd == "reset-patient":
-        return _reset_patient(args)
-    return 1
+
+def _ingest(args) -> int:
+    from clinicalchat.config import get_settings
+    from clinicalchat.infrastructure.vector_index import VectorIndex
+    from clinicalchat.ingestion.corpus import corpus_stats, load_corpus
+    from clinicalchat.services.knowledge_base import KnowledgeBase
+
+    settings = get_settings()
+    docs, registry = load_corpus(settings, rebuild=args.rebuild)
+    index = VectorIndex(settings)
+    if args.rebuild:
+        index.index(docs, force=True)
+    kb = KnowledgeBase(settings, docs, registry, index)
+    print(json.dumps({**corpus_stats(docs, registry), **kb.stats()}, indent=2))
+    return 0
+
+
+def _ask(args) -> int:
+    from clinicalchat.container import get_container
+    from clinicalchat.domain.conversation import ChatSession
+
+    container = get_container()
+    persona = container.accounts.get_persona(args.user)
+    if not persona:
+        print(f"Unknown user {args.user}", file=sys.stderr)
+        return 2
+    session = ChatSession(username=persona.username, role=persona.role, display_name=persona.display_name,
+                          own_patient=persona.patient_key, selected_patient=persona.patient_key or args.patient)
+    for ev in container.chat.ask(args.question, session):
+        if ev.kind == "status":
+            print(f"[{'..' if ev.status == 'pending' else 'ok'}] {ev.title}: {ev.text}", file=sys.stderr)
+        elif ev.kind != "partial":
+            print(f"\n=== {ev.title} ===\n{ev.text}")
+    return 0
+
+
+def _server_running(port: int) -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
 def _reset_patient(args) -> int:
-    import socket
-
     from clinicalchat.config import get_settings
-    from clinicalchat.store import Store
-    from clinicalchat.vectorstore import ClinicalVectorStore
 
     settings = get_settings()
-    with socket.socket() as sock:
-        sock.settimeout(1)
-        if sock.connect_ex(("127.0.0.1", settings.port)) == 0:
-            print(f"The server is running on port {settings.port}. Stop it first: it keeps patient data in memory "
-                  "and would write it back.", file=sys.stderr)
-            return 2
-    store = Store()
-    user = store.get_user(args.patient) or next((u for u in store.users() if u["patient_key"] == args.patient), None)
+    if _server_running(settings.port):
+        print(f"The server is running on port {settings.port}. Stop it first: it keeps patient data in memory "
+              "and would write it back.", file=sys.stderr)
+        return 2
+    admin = _admin(settings)
+    user = admin.find_user(args.patient)
     key = user["patient_key"] if user else args.patient
-    uploads, cases = store.uploads(key), store.cases(patient_key=key)
-    if not user and not uploads and not cases:
+    counts = admin.summary(key)
+    if not user and not any(counts.values()):
         print(f"Nothing stored for '{args.patient}'.", file=sys.stderr)
         return 1
     who = f"{user['display_name']} ({key})" if user else key
-    print(f"{who}: {len(uploads)} upload(s), {len(cases)} case(s)"
+    print(f"{who}: {counts['uploads']} upload(s), {counts['cases']} case(s)"
           + ("; the login will be DELETED" if args.delete_login else "; the login is kept"))
     if not args.yes and input("Delete? [y/N] ").strip().lower() != "y":
         return 1
-    removed = store.purge_patient(key, delete_login=args.delete_login)
-    vectors = ClinicalVectorStore(settings)
-    removed["index_chunks"] = vectors.purge_uploads(key)
-    exports = list(settings.export_dir.glob(f"clinicalchat-{user['username']}-*.md")) if user else []
-    for path in exports:
-        path.unlink()
-    removed["exports"] = len(exports)
-    print(json.dumps(removed))
+    print(json.dumps(admin.purge(key, delete_login=args.delete_login)))
     return 0
+
+
+def _admin(settings):
+    """Only the database, vector index and export folder — no need to load the dataset for a purge."""
+    from clinicalchat.container import Repositories
+    from clinicalchat.infrastructure.database import Database
+    from clinicalchat.infrastructure.vector_index import VectorIndex
+    from clinicalchat.services.admin import PatientDataAdmin
+    from clinicalchat.services.export import SessionExporter
+
+    r = Repositories.on(Database(settings.database_path))
+    return PatientDataAdmin(r.users, r.uploads, r.facts, r.cases, r.feedback, r.insights, VectorIndex(settings),
+                            SessionExporter(None, settings.export_dir))
 
 
 if __name__ == "__main__":

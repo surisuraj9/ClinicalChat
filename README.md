@@ -57,7 +57,7 @@ A case is work for the care team, so simple doubts don't create one. A patient q
 
 Any other personal question ("what do my reports mean?", "is it serious?") is just answered. If there is an open case, the answer says so and the case is not changed.
 
-### LLM budget (important with rate-limited back ends)
+### LLM budget
 
 - Routing, extraction, clinical analysis and risk detection use **no LLM calls**.
 - **Patient question = 1 call** (Communication, fast model), whatever it is. Communication works from the automatic findings, or from the last Insight if one exists. When a case is opened, Insight (strong model) is written **in the background** for the care team, and the patient does not wait for it. Insight is reused while the patient's reports, symptoms/allergies, radiologist reads and risk level are unchanged.
@@ -72,7 +72,6 @@ Any other personal question ("what do my reports mean?", "is it serious?") is ju
 | Reading attached reports | files are read/OCR'd **in parallel** (up to 4 at a time) |
 | AI answer — OpenAI (`gpt-4.1-mini`, streamed) | **measured:** first words 0.9–1.8 s, finished 2.2–3.3 s |
 | Care-team Insight — OpenAI (`gpt-4.1`, background) | ~3 s after the patient's answer; the patient never waits for it |
-| AI answer — Copilot CLI fallback | ~15–60 s per call (process start + large built-in prompt, no streaming) |
 | Repeated / similar general question | instant (FAQ cache, no AI) |
 
 What makes it fast:
@@ -83,7 +82,7 @@ What makes it fast:
 - **Warm start.** The OpenAI connection is opened when the server starts. This does not use tokens.
 - **FAQ cache.** General questions are matched on their key terms (and the patient's allergies).
 
-To use OpenAI, copy the template and put the keys in **`.env`**, then restart. `LLM_PROVIDER=auto` picks OpenAI automatically:
+To use OpenAI, copy the template and put the keys in **`.env`**, then restart. Without `OPENAI_API_KEY` the app still runs and answers from the rule-based findings only:
 
 ```bash
 cp .env.example .env && chmod 600 .env   # .env is git-ignored
@@ -93,7 +92,6 @@ cp .env.example .env && chmod 600 .env   # .env is git-ignored
 > ⚠️ Never put real keys in `.env.example`. It is committed to git.
 
 With the Langfuse keys set, every AI call is traced to Langfuse (agent name, model, prompt, tokens, latency). The JSONL audit log in `data/audit/` is always on.
-- **Copilot CLI back end:** calls run one at a time; the adapter stops at the first HTTP 429 and a 2-minute circuit breaker blocks further calls.
 
 ### 🌐 Web search (Tavily, trusted sites only)
 
@@ -106,7 +104,7 @@ With `TAVILY_API_KEY` set, three steps can use current information from trusted 
 | Medicine the knowledge graph does not know | "can I take / is X safe / prescribed X" with an unknown brand | DailyMed, MedlinePlus, drugs.com, 1mg, EMA, FDA | ingredients found → the normal allergy / interaction checks run on them |
 
 Guardrails:
-- **No patient details leave the server.** Patient names, record keys, IDs/MRNs, dates, phone numbers and e-mails are stripped from every query (`websearch.deidentify`). Drug look-ups send only the medicine name.
+- **No patient details leave the server.** Patient names, record keys, IDs/MRNs, dates, phone numbers and e-mails are stripped from every query (`domain/privacy.py`). Drug look-ups send only the medicine name.
 - **Only trusted domains.** They are passed to Tavily and checked again on every result.
 - **Web results can only add warnings.** They never change the risk level or clear an allergy warning. If a medicine's ingredients can't be recognised, it says so and asks the patient to check with a pharmacist.
 - **Logged and cached.** Results are cached for 7 days (`web_cache` table), each search is in the audit log (`web_searches`) and appears as a span in Langfuse.
@@ -114,20 +112,30 @@ Guardrails:
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    U[Login / Signup] --> UI[Gradio chat]
-    UI --> O[Orchestrator + RBAC router]
-    O --> DE[1 Data Extraction]
-    DE --> CA[2 Clinical Analysis<br/>Lab · Radiology · Allergy KG]
-    CA --> RD[3 Risk Detection]
-    RD --> IG[4 Insight Generation - LLM]
-    IG --> PC[5 Patient Communication - LLM]
-    PC --> RQ[Clinician review queue]
-    RQ --> UI
-    O --> DB[(SQLite: users, uploads, cases, feedback)]
-    O --> AU[Audit JSONL / Langfuse]
+![Five-agent pipeline](docs/diagrams/03-agent-pipeline.png)
+
+The code is split into layers. Each layer only uses the layers below it, and `container.py` creates and wires every object (dependency injection):
+
+```text
+src/clinicalchat/
+├── cli.py            clinicalchat serve | ingest | ask | reset-patient
+├── config.py         settings from .env
+├── container.py      composition root: builds and wires everything
+├── web/              FastAPI + Gradio: app, layout, controller, chat renderer, sidebar, components, theme
+├── services/         use cases: chat, uploads, pipeline, responders, cases, care team, web enrichment, accounts…
+├── presenters/       Markdown for findings, answers, case status and role-specific case views
+├── agents/           the 5 agents, 4 specialists, the guard and the shared LLM base / prompts
+├── ingestion/        DOCX / PDF / OCR / XLSX readers, per-patient sections, lab tables, registry
+├── knowledge/        medical ontology + NetworkX knowledge graph
+├── infrastructure/   SQLite repositories, ChromaDB, OpenAI models + cache, Tavily, Langfuse, audit log
+└── domain/           models, roles (RBAC), risk, case workflow, personas, conversation
 ```
+
+| Document | What it covers |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Diagrams: system context, layers, DI wiring, agent pipeline, question sequence, upload flow, case states, deployment; SOLID mapping |
+| [docs/FILE_GUIDE.md](docs/FILE_GUIDE.md) | Every file: what it does, who calls it, and how |
+| [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | Plain-English tour of the agents and the tools they use |
 
 | Role | Agents | Data |
 |---|---|---|
@@ -166,7 +174,7 @@ These example queries from the problem statement are available as one-click sugg
 ```bash
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
-cp .env.example .env               # set OPENAI_API_KEY, or leave empty to use the Copilot CLI
+cp .env.example .env               # set OPENAI_API_KEY (and optionally TAVILY / LANGFUSE keys)
 .venv/bin/clinicalchat ingest      # parse data/raw + build the vector index (about 30 s on first run)
 .venv/bin/clinicalchat serve       # http://localhost:7860
 ```

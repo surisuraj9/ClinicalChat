@@ -1,0 +1,23 @@
+flowchart TB
+    CLI["cli.py<br/>serve · ingest · ask · reset-patient"]
+    WEB["web/<br/>app · layout · controller · renderer · components"]
+    CONT["container.py<br/>composition root: builds and wires everything"]
+    SVC["services/<br/>chat · uploads · pipeline · responders · cases · care_team · router …"]
+    PRES["presenters/<br/>markdown for findings, answers, case views"]
+    AG["agents/<br/>extraction · analysis · risk · insight · communication · guard"]
+    ING["ingestion/<br/>loaders · OCR · sections · lab tables · registry"]
+    KN["knowledge/<br/>ontology + NetworkX graph"]
+    INF["infrastructure/<br/>SQLite repositories · ChromaDB · OpenAI · Tavily · Langfuse · audit"]
+    DOM["domain/<br/>models · roles · workflow · risk · personas · conversation"]
+    CLI --> CONT
+    WEB --> CONT
+    CONT --> SVC & INF
+    WEB --> SVC
+    SVC --> AG & PRES & INF & ING & KN
+    AG --> KN & ING
+    PRES --> DOM
+    AG --> DOM
+    SVC --> DOM
+    INF --> DOM
+    ING --> DOM
+    KN --> DOM

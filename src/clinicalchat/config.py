@@ -27,12 +27,10 @@ def _path(name: str, default: Path) -> Path:
 
 @dataclass(frozen=True)
 class Settings:
-    project_root: Path = PROJECT_ROOT
     data_dir: Path = field(default_factory=lambda: _path("DATA_DIR", PROJECT_ROOT / "data" / "raw"))
     work_dir: Path = field(default_factory=lambda: _path("WORK_DIR", PROJECT_ROOT / "data"))
 
-    # LLM: "auto" = OpenAI when OPENAI_API_KEY is set, otherwise the local GitHub Copilot CLI
-    llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "auto").lower())
+    # LLM: OpenAI. Without a key the AI agents are unavailable; every rule-based feature still works.
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     # strong model for the clinician-facing Insight agent, fast model for patient-facing answers
     openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4.1"))
@@ -41,11 +39,6 @@ class Settings:
     # output length is what drives LLM latency: hard caps per agent
     insight_max_tokens: int = field(default_factory=lambda: int(os.getenv("INSIGHT_MAX_TOKENS", "1600")))
     communication_max_tokens: int = field(default_factory=lambda: int(os.getenv("COMMUNICATION_MAX_TOKENS", "600")))
-    copilot_model: str = field(default_factory=lambda: os.getenv("COPILOT_MODEL", "gpt-4.1"))
-    copilot_bin: str = field(default_factory=lambda: os.getenv("COPILOT_BIN", "copilot"))
-    # one call at a time keeps the Copilot backend well under its rate limits
-    copilot_max_parallel: int = field(default_factory=lambda: int(os.getenv("COPILOT_MAX_PARALLEL", "1")))
-    copilot_timeout: int = field(default_factory=lambda: int(os.getenv("COPILOT_TIMEOUT_SECONDS", "180")))
     llm_cache: bool = field(default_factory=lambda: _bool("LLM_CACHE", True))
     llm_retries: int = field(default_factory=lambda: int(os.getenv("LLM_RETRIES", "2")))
 
@@ -67,6 +60,10 @@ class Settings:
     demo_password: str = field(default_factory=lambda: os.getenv("DEMO_PASSWORD", "demo@123"))
 
     @property
+    def database_path(self) -> Path:
+        return self.work_dir / "state" / "clinicalchat.db"
+
+    @property
     def processed_dir(self) -> Path:
         return self.work_dir / "processed"
 
@@ -85,10 +82,6 @@ class Settings:
     @property
     def cache_dir(self) -> Path:
         return self.work_dir / "cache"
-
-    @property
-    def copilot_home(self) -> Path:
-        return _path("COPILOT_HOME_DIR", self.project_root / ".copilot-llm-home")
 
     @property
     def langfuse_enabled(self) -> bool:

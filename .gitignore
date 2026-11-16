@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
-.copilot-llm-home/
 logs/
 data/processed/
 data/chroma/
