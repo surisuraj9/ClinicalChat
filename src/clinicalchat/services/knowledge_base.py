@@ -11,6 +11,7 @@ from clinicalchat.config import Settings
 from clinicalchat.domain.models import ClinicalDocument, PatientProfile
 from clinicalchat.ingestion.corpus import load_corpus
 from clinicalchat.ingestion.registry import PatientRegistry
+from clinicalchat.ingestion.uploads import reparse_generic_upload
 from clinicalchat.infrastructure.vector_index import VectorIndex
 from clinicalchat.knowledge.graph import MedicalKnowledgeGraph
 from clinicalchat.services.catalog import DocumentCatalog
@@ -64,7 +65,11 @@ class KnowledgeBase:
             self.patients.apply_fact(f["patient_key"], f["kind"], f["value"], refresh=False)
         for row in uploads:
             try:
-                self.add_document(ClinicalDocument.model_validate_json(row["doc_json"]))
+                doc = ClinicalDocument.model_validate_json(row["doc_json"])
+                if reparse_generic_upload(doc):
+                    log.info("Upload %s re-read as %s (%d lab values)", doc.filename, doc.category,
+                             sum(len(s.lab_results) for s in doc.sections))
+                self.add_document(doc)
             except Exception:  # a corrupt upload must not stop the app
                 log.exception("Could not reload upload %s", row["doc_id"])
         for u in users:

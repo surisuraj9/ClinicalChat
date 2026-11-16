@@ -1,14 +1,15 @@
 flowchart LR
-    U([Browser]) -->|"HTTPS"| ALB["AWS load balancer / HTTPS"]
-    subgraph AWS["AWS (planned)"]
-        ALB --> APP["Container: clinicalchat serve<br/>port 7860, /health check"]
-        APP --- VOL[("Persistent volume<br/>data/state · chroma · audit · exports")]
-        SEC["Secrets: OPENAI · TAVILY · LANGFUSE keys"] -.-> APP
+    U([Browser / API client]) -->|"HTTP :8000"| SG["EC2 security group<br/>22 (your IP) · 8000"]
+    subgraph EC2["AWS EC2 (Ubuntu, t3.medium)"]
+        SG --> SVC["systemd: clinicalchat.service<br/>clinicalchat serve · PORT=8000<br/>restart on failure"]
+        SVC --- ENV[".env in the app folder (chmod 600)<br/>OPENAI · TAVILY · LANGFUSE keys"]
+        SVC --- VOL[("data/<br/>state · chroma · audit · exports")]
+        SETUP["deployment/ec2-setup.sh<br/>uv · Python 3.11 · pinned requirements ·<br/>clinicalchat ingest · health wait"] -.-> SVC
     end
-    APP -->|"HTTPS"| OAI{{"OpenAI API"}}
-    APP -->|"HTTPS"| TAV{{"Tavily API"}}
-    APP -.->|"HTTPS"| LF{{"Langfuse"}}
-    subgraph BUILD["Docker image build"]
-        SRC["src + data/raw"] --> ING["clinicalchat ingest<br/>(parse dataset + vector index)"]
+    SVC -->|"HTTPS"| OAI{{"OpenAI API"}}
+    SVC -->|"HTTPS"| TAV{{"Tavily API"}}
+    SVC -.->|"HTTPS · flushed on shutdown"| LF{{"Langfuse"}}
+    subgraph ALT["Alternative: Docker"]
+        IMG["docker build · ingest at build time ·<br/>HEALTHCHECK /api/health"]
     end
-    ING -.-> APP
+    IMG -.-> SVC

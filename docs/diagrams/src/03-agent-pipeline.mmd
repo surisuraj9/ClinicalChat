@@ -4,21 +4,23 @@ flowchart LR
     RT -->|"general"| W["🌐 Tavily + reference docs"] --> CM
     RT -->|"status"| ST["📁 Case status<br/>(no AI)"]
     subgraph RULES["Rule-based steps · milliseconds · no AI"]
-        E["📄 1 Data Extraction<br/>pick records, quality score"]
-        A["🔬 2 Clinical Analysis"]
-        RK["🚨 3 Risk Detection<br/>LOW → CRITICAL"]
+        E["📄 1 Data Extraction<br/>pick records (RBAC), quality score,<br/>vector search (embeddings)"]
+        A["🔬 2 Clinical Analysis<br/>rules + knowledge graph"]
+        RK["🚨 3 Risk Detection<br/>LOW → CRITICAL, panic values"]
         E --> A --> RK
     end
-    subgraph SPEC["Specialists inside step 2"]
-        L["🧪 Lab interpreter"]
-        RA["🩻 Radiology analyzer"]
-        AL["⚠️ Allergy safety<br/>knowledge graph"]
-        SY["🤒 Symptom reasoner"]
+    subgraph SPEC["Course AI specialists (staff: in step 2 · patient: background)"]
+        L["🧪 Lab Interpreter<br/>LabInterpretation"]
+        RA["🩻 Radiology Analyzer<br/>RadiologyFinding"]
+        AL["🛡️ Allergy Safety<br/>AllergyAssessment"]
     end
-    A -.-> L & RA & AL & SY
+    A -.->|"parallel · gpt-4.1-mini ·<br/>only record types the role may see"| SPEC
+    SPEC -.->|"AI urgency can only raise the risk"| RK
+    A -.->|"staff guideline question:<br/>search starts now"| W2["🌐 Guideline search<br/>(parallel)"]
     RK -->|"staff"| IN["💡 4 Insight Generation<br/>AI · gpt-4.1"]
+    W2 -.-> IN
     RK -->|"patient"| CM["💬 5 Patient Communication<br/>AI · gpt-4.1-mini, streamed"]
     CM --> G["🛡️ Guard<br/>no doses, no definitive diagnosis"]
-    G --> OUT["Answer in chat"]
+    G --> OUT["Answer in chat / API"]
     IN --> OUT
-    CM -.->|"case opened"| BG["💡 Insight in background<br/>for the care team"]
+    CM -.->|"case opened"| BG["💡 Insight + AI specialists<br/>in background for the care team"]

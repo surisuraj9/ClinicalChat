@@ -1,0 +1,45 @@
+flowchart LR
+  n0["MEDICATION: aspirin"]:::medication
+  n1["DIAGNOSIS: Myocardial infarction"]:::diagnosis
+  n0 -->|TREATS| n1
+  n2["MEDICATION: amoxicillin"]:::medication
+  n3["DIAGNOSIS: Pneumonia"]:::diagnosis
+  n2 -->|TREATS| n3
+  n4["MEDICATION: ramipril"]:::medication
+  n5["DIAGNOSIS: Chronic kidney disease"]:::diagnosis
+  n4 -->|TREATS| n5
+  n4 -->|TREATS| n1
+  n6["MEDICATION: metformin"]:::medication
+  n7["DIAGNOSIS: Type 2 diabetes mellitus"]:::diagnosis
+  n6 -->|TREATS| n7
+  n8["ALLERGEN: latex"]:::allergen
+  n9["ALLERGEN: banana"]:::allergen
+  n8 -->|CROSS_REACTIVE| n9
+  n10["ALLERGEN: avocado"]:::allergen
+  n8 -->|CROSS_REACTIVE| n10
+  n11["ALLERGEN: kiwi"]:::allergen
+  n8 -->|CROSS_REACTIVE| n11
+  n12["ALLERGEN: ibuprofen"]:::allergen
+  n13["ALLERGEN: aspirin"]:::allergen
+  n12 -->|CROSS_REACTIVE| n13
+  n14["TEST: HbA1c"]:::test
+  n14 -->|CONFIRMS| n7
+  n15["TEST: Fasting glucose"]:::test
+  n15 -->|CONFIRMS| n7
+  n16["TEST: eGFR"]:::test
+  n16 -->|CONFIRMS| n5
+  n17["SYMPTOM: chest pain"]:::symptom
+  n17 -->|INDICATES| n1
+  n17 -->|INDICATES| n3
+  n18["SYMPTOM: shortness of breath"]:::symptom
+  n18 -->|INDICATES| n3
+  n18 -->|INDICATES| n1
+  n19["SYMPTOM: cough"]:::symptom
+  n19 -->|INDICATES| n3
+  n20["SYMPTOM: fever"]:::symptom
+  n20 -->|INDICATES| n3
+  classDef allergen fill:#fdecea,stroke:#c0392b
+  classDef test fill:#e8f1fb,stroke:#2c6fb7
+  classDef symptom fill:#fff6e0,stroke:#c98a00
+  classDef diagnosis fill:#eaf7ee,stroke:#2e8b57
+  classDef medication fill:#f1ecfb,stroke:#6c4fb3

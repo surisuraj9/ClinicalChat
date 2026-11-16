@@ -7,7 +7,7 @@ Lab Interpreter, Radiology Analyzer, Allergy Safety, plus symptom reasoning (dif
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from clinicalchat.agents.extraction import ExtractionResult
 from clinicalchat.agents.specialists.allergy import AllergyFindings, AllergySafety
@@ -19,6 +19,9 @@ from clinicalchat.knowledge.graph import MedicalKnowledgeGraph
 from clinicalchat.services.catalog import DocumentCatalog
 from clinicalchat.services.patients import PatientDirectory
 from clinicalchat.services.safety import SafetyChecker
+
+if TYPE_CHECKING:
+    from clinicalchat.agents.specialists.ai import SpecialistReport
 
 
 @dataclass
@@ -35,6 +38,8 @@ class AnalysisResult:
     documented_conditions: List[str] = field(default_factory=list)
     inconsistencies: List[str] = field(default_factory=list)
     specialists: List[str] = field(default_factory=list)  # which analysers had data
+    allergy_record_visible: bool = True  # False for roles without the allergy domain (alerts only, no allergy list)
+    ai: Optional["SpecialistReport"] = None  # the course LLM specialists (structured), when they ran
 
     @property
     def possible_conditions(self) -> List[str]:
@@ -52,6 +57,8 @@ class AnalysisResult:
         if self.documented_conditions:
             out.append("DOCUMENTED CONDITIONS: " + ", ".join(self.documented_conditions))
         out += [f"CLINICAL INCONSISTENCY: {i}" for i in self.inconsistencies]
+        if self.ai:
+            out += self.ai.facts_lines()
         return "\n".join(out) or "No structured findings."
 
     def _lab_facts(self) -> List[str]:
@@ -89,9 +96,9 @@ class ClinicalAnalysisAgent:
         self.symptoms = SymptomReasoner(kg)
 
     def run(self, ext: ExtractionResult, drugs: Sequence[str], allergens: Sequence[str],
-            check_allergies: bool = True) -> AnalysisResult:
+            check_allergies: bool = True, allergy_record: bool = True) -> AnalysisResult:
         key = ext.patient_key
-        res = AnalysisResult()
+        res = AnalysisResult(allergy_record_visible=allergy_record)
         labs = self._labs(ext)
         res.lab_results, res.abnormal, res.lab_conditions = labs.results, labs.abnormal, labs.conditions
         res.imaging = [analyse_imaging(s, self.catalog.source_of(s)) for s in ext.sections
@@ -101,7 +108,10 @@ class ClinicalAnalysisAgent:
         if res.imaging:
             res.specialists.append("Radiology Analyzer")
         if check_allergies:
-            self._apply_allergy(res, self.allergy.check(self.patients.get(key), drugs, allergens), drugs, allergens)
+            found = self.allergy.check(self.patients.get(key), drugs, allergens)
+            if not allergy_record:  # RBAC: keep only the alerts for what was asked about (e.g. contrast)
+                found = AllergyFindings(drug_alerts=found.drug_alerts)
+            self._apply_allergy(res, found, drugs, allergens)
         res.differential = self.symptoms.differential(ext.symptoms, ext.new_symptoms, key)
         if key:
             res.documented_conditions = [c["condition"] for c in self.kg.patient_conditions(key) if c["basis"] == "documented"]

@@ -42,8 +42,17 @@ class Settings:
     llm_cache: bool = field(default_factory=lambda: _bool("LLM_CACHE", True))
     llm_retries: int = field(default_factory=lambda: int(os.getenv("LLM_RETRIES", "2")))
 
+    # course specialists (Lab Interpreter / Radiology Analyzer / Allergy Safety): "llm" = AI agents with structured
+    # output (rule-based findings stay as the safety net), "rules" = rule-based only. Default: llm when a key is set.
+    specialist_agents: str = field(default_factory=lambda: os.getenv("SPECIALIST_AGENTS", "auto").lower())
+    openai_specialist_model: str = field(default_factory=lambda: os.getenv("OPENAI_SPECIALIST_MODEL", "gpt-4.1-mini"))
+    specialist_max_tokens: int = field(default_factory=lambda: int(os.getenv("SPECIALIST_MAX_TOKENS", "900")))
+
+    # embeddings: auto = OpenAI when a key is set, else the local MiniLM model | openai | local
     embedding_provider: str = field(default_factory=lambda: os.getenv("EMBEDDING_PROVIDER", "auto").lower())
     embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"))
+    openai_embedding_model: str = field(
+        default_factory=lambda: os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
     ocr_enabled: bool = field(default_factory=lambda: _bool("OCR_ENABLED", True))
 
     # Tavily web search (trusted medical sites only); off when no key
@@ -82,6 +91,10 @@ class Settings:
     @property
     def cache_dir(self) -> Path:
         return self.work_dir / "cache"
+
+    @property
+    def specialists_use_llm(self) -> bool:
+        return self.specialist_agents == "llm" or (self.specialist_agents == "auto" and bool(self.openai_api_key))
 
     @property
     def langfuse_enabled(self) -> bool:

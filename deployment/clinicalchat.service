@@ -1,0 +1,26 @@
+# systemd unit for ClinicalChat on EC2 (installed by ec2-setup.sh; paths are filled in by the script).
+[Unit]
+Description=ClinicalChat - multi-agent clinical decision support (Gradio UI + REST API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+Environment=CLINICALCHAT_HOME=__APP_DIR__
+Environment=PORT=8000
+Environment=PYTHONUNBUFFERED=1
+Environment=GRADIO_ANALYTICS_ENABLED=False
+Environment=ANONYMIZED_TELEMETRY=False
+# OPENAI_API_KEY, LANGFUSE_*, TAVILY_API_KEY, DEMO_PASSWORD ... live in .env (chmod 600, never committed)
+EnvironmentFile=-__APP_DIR__/.env
+ExecStart=__APP_DIR__/.venv/bin/clinicalchat serve
+Restart=on-failure
+RestartSec=5
+# on stop the app finishes background care-team insights and flushes the Langfuse traces
+TimeoutStopSec=90
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

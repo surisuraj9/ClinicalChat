@@ -37,6 +37,9 @@ IMAGING_TERMS = {
     "mammogram": r"mammo|breast",
 }
 
+# panel word -> pattern that recognises it in a report title, test names or text ("16thDecTSH" -> TSH -> thyroid)
+PANEL_PATTERNS = {w: rx for rx, words in LAB_PANELS.items() if len(words) == 1 for w in words}
+
 
 @dataclass
 class ExtractionResult:
@@ -88,11 +91,15 @@ class DataExtractionAgent:
             sections = [s for s in sections if s.doc_id in set(upload_doc_ids)] or sections
         else:
             sections = self._focus(question, sections)
-        res.sections = sections
+        related = [] if sections or not res.focus else self._related(question, self.catalog.patient_sections(key, visible))
+        res.sections = sections or related
         res.symptoms = list(dict.fromkeys([*self.kg.patient_symptoms(key), *res.new_symptoms]))
         on_file = set(self.patients.domains_of(key))
-        res.missing += [f"No {d.value.replace('_', ' ')} reports on file" for d in res.focus
-                        if d != Domain.REFERENCE and d not in on_file]
+        absent = [d.value.replace("_", " ") for d in res.focus if d != Domain.REFERENCE and d not in on_file]
+        if absent and related:
+            res.missing.append(f"No {', '.join(absent)} reports on file — using matching content from other records")
+        else:
+            res.missing += [f"No {d} reports on file" for d in absent]
         if not sections and not res.missing:
             res.missing.append("No diagnostic reports on file — upload any reports you have (📎)")
         patient = self.patients.get(key)
@@ -108,17 +115,30 @@ class DataExtractionAgent:
 
     def _focus(self, question: str, sections: List[Section]) -> List[Section]:
         """"Explain my thyroid results" -> only the thyroid panel; "my chest x-ray" -> only matching imaging."""
-        q = question.lower()
-        panels = {w for rx, words in LAB_PANELS.items() if re.search(rx, q) for w in words}
-        modal = [t for t, rx in IMAGING_TERMS.items() if re.search(rx, q)]
+        panels, modal = self._terms(question)
         if not panels and not modal:
             return sections
         keep = [s for s in sections if self._matches(s, panels, modal)]
         return keep or sections
 
+    def _related(self, question: str, sections: List[Section]) -> List[Section]:
+        """No report of the asked type: other visible records that mention what was asked (e.g. a TSH value in a
+        clinical note). Nothing when the question names no specific test or study."""
+        panels, modal = self._terms(question)
+        patterns = [PANEL_PATTERNS[w] for w in panels if w in PANEL_PATTERNS] + [IMAGING_TERMS[t] for t in modal]
+        return [s for s in sections if any(re.search(rx, f"{s.title} {s.text}", re.I) for rx in patterns)]
+
+    @staticmethod
+    def _terms(question: str):
+        q = question.lower()
+        return ({w for rx, words in LAB_PANELS.items() if re.search(rx, q) for w in words},
+                [t for t, rx in IMAGING_TERMS.items() if re.search(rx, q)])
+
     def _matches(self, s: Section, panels: set, modal: List[str]) -> bool:
         if s.lab_results:
             head = (s.title + " " + self.catalog.source_of(s)).lower()
-            return bool(panels) and any(w in head for w in panels)
+            tests = " ".join(r.parameter for r in s.lab_results).lower()
+            return bool(panels) and any(w in head or (w in PANEL_PATTERNS and re.search(PANEL_PATTERNS[w], tests))
+                                        for w in panels)
         text = (s.title + " " + s.text[:300]).lower()
         return bool(modal) and any(re.search(IMAGING_TERMS[t], text) for t in modal)

@@ -17,12 +17,13 @@ from clinicalchat.agents.llm.base import AgentResult
 from clinicalchat.domain.conversation import Event
 from clinicalchat.domain.roles import AGENT_LABELS, AgentName, policy
 from clinicalchat.infrastructure.repositories.caches import FaqCache
-from clinicalchat.infrastructure.tracing import Tracer
 from clinicalchat.presenters.answers import general_answer_footer, render_insight
 from clinicalchat.services.answer_writer import AnswerWriter
 from clinicalchat.services.cases import CaseFiler
 from clinicalchat.services.communicator import Communicator
+from clinicalchat.infrastructure.tracing import activate
 from clinicalchat.services.insight_service import InsightService, review_reasons
+from clinicalchat.services.observability import end_agent_span
 from clinicalchat.services.patients import PatientDirectory
 from clinicalchat.services.records import RecordRetriever
 from clinicalchat.services.turn import TurnContext
@@ -40,20 +41,28 @@ def _remember(ctx: TurnContext, output: dict) -> None:
 
 
 class StaffResponder:
-    def __init__(self, insight: InsightService, web: WebEnrichment, communicator: Communicator, tracer: Tracer):
+    def __init__(self, insight: InsightService, web: WebEnrichment, communicator: Communicator):
         self.insight = insight
         self.web = web
         self.communicator = communicator
-        self.tracer = tracer
+
+    def prefetch(self, ctx: TurnContext) -> None:
+        """Called by the pipeline once the rule-based findings are known: start the guideline search now, so it runs
+        while the AI specialists work instead of after them."""
+        if wants_guidelines(ctx.question):
+            ctx.run.web_prefetch = self.web.start("guideline", self._guideline_query(ctx), ctx)
 
     def respond(self, ctx: TurnContext) -> Iterator[Event]:
         run, question = ctx.run, ctx.question
         yield Event("status", f"{INSIGHT} — writing", "Consolidating the findings (AI)…", "pending", "agent-insight")
         web = None
         if wants_guidelines(question):
-            web = yield from self.web.search("guideline", guideline_query(question, run.analysis.possible_conditions), ctx)
+            web = yield from self.web.search("guideline", self._guideline_query(ctx), ctx, started=run.web_prefetch)
+        span = ctx.trace.child("insight-generation", as_type="agent", input={"question": question},
+                               metadata={"audience": ctx.session.role.value})
         ins = self.insight.write(question, policy(ctx.session.role).audience, ctx.patient_key, run,
-                                 ctx.session.history_text(), self.tracer.config_for(ctx.session), web=web)
+                                 ctx.session.history_text(), span, ctx.llm_config(span), web=web)
+        end_agent_span(span, ins)
         run.llm.append(ins)
         out = ins.output or {}
         run.review_reasons = review_reasons(run.ext, run.analysis, run.risk, ins)
@@ -67,13 +76,16 @@ class StaffResponder:
         if ctx.plan.mode == "explain" and not ins.error:
             yield from self.communicator.communicate(ctx, out, run.risk.clinical_level, run.abnormal)
 
+    @staticmethod
+    def _guideline_query(ctx: TurnContext) -> str:
+        return guideline_query(ctx.question, ctx.run.analysis.possible_conditions)
+
 
 class PatientResponder:
-    def __init__(self, insight: InsightService, cases: CaseFiler, communicator: Communicator, tracer: Tracer):
+    def __init__(self, insight: InsightService, cases: CaseFiler, communicator: Communicator):
         self.insight = insight
         self.cases = cases
         self.communicator = communicator
-        self.tracer = tracer
 
     def respond(self, ctx: TurnContext, upload_doc_ids=()) -> Iterator[Event]:
         run, plan, key = ctx.run, ctx.plan, ctx.patient_key
@@ -88,12 +100,12 @@ class PatientResponder:
         run.review_reasons = review_reasons(run.ext, run.analysis, run.risk, reused)
         background = bool(key and run.file_case and cached is None)
         yield self._insight_status(cached is not None, background)
-        basis = cached or self.insight.rule_based(ctx.question, run)
+        with activate(ctx.trace):
+            basis = cached or self.insight.rule_based(ctx.question, run)
         _remember(ctx, basis)
         yield from self.communicator.communicate(ctx, basis, run.risk.clinical_level, run.abnormal)
         if background and ctx.turn.case_id:
-            self.insight.in_background(ctx.turn.case_id, ctx, ctx.session.history_text(),
-                                       self.tracer.config_for(ctx.session))
+            self.insight.in_background(ctx.turn.case_id, ctx, ctx.session.history_text())
 
     @staticmethod
     def _insight_status(reused: bool, background: bool) -> Event:
@@ -123,20 +135,25 @@ class GeneralResponder:
         allergies = self.patients.allergy_text(ctx.patient_key)
         hit = self.faq.lookup(question, allergies)
         if hit:
+            ctx.trace.child("faq-cache", as_type="tool", input={"question": question}).end({"matched": hit["question"]})
             yield Event("status", f"{COMMUNICATION} — instant", f"Answered before (“{hit['question'][:60]}”) — reused, "
                         "no AI call", "done", "agent-communication")
             ctx.turn.add_answer(COMMUNICATION, hit["answer"], hit["answer"])
             yield Event("answer", COMMUNICATION, hit["answer"], data={"agent": "communication", "faq_cache": True})
             return
         web = yield from self.web.search("health", question, ctx, wait=WEB_WAIT_PATIENT)
-        context, sources = self.records.reference_context(question)
+        with activate(ctx.trace):
+            context, sources = self.records.reference_context(question)
         if web and web.results:
             context += "\n\n## Trusted health websites (current, public information)\n" + web.context()
         yield Event("status", f"{COMMUNICATION} — answering", "Looking up reference information and writing an answer (AI)…",
                     "pending", "agent-communication")
-        com = yield from self.writer.write("💬 Writing your answer…", ctx.session, False, question=question,
+        span = ctx.trace.child("patient-communication", as_type="agent", input={"question": question},
+                               metadata={"general_question": True, "web_sources": len(web.results) if web else 0})
+        com = yield from self.writer.write("💬 Writing your answer…", ctx.llm_config(span), False, question=question,
                                            patient=f"Documented allergies: {allergies}",
                                            risk="Not applicable (general question).", insight=context, general=True)
+        end_agent_span(span, com)
         ctx.run.llm.append(com)
         yield Event("status", f"{COMMUNICATION} — {'failed' if com.error else 'done'}", com.timing(), "done",
                     "agent-communication")

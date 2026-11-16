@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -13,6 +14,7 @@ from clinicalchat.domain.conversation import ChatSession, Turn
 from clinicalchat.domain.risk import RiskAssessment
 from clinicalchat.domain.roles import Role
 from clinicalchat.domain.web_evidence import WebSearchOutcome
+from clinicalchat.infrastructure.tracing import NULL_SPAN, Span
 from clinicalchat.services.router import RoutePlan
 
 
@@ -29,6 +31,7 @@ class PipelineRun:
     evidence_fp: str = ""  # Insight cache key
     case_fp: str = ""  # what a case covered (for the escalation safety net)
     web: List[WebSearchOutcome] = field(default_factory=list)
+    web_prefetch: Optional[Future] = None  # staff guideline search started while the AI specialists work
 
     @property
     def abnormal(self) -> bool:
@@ -43,6 +46,7 @@ class TurnContext:
     turn: Turn
     run: PipelineRun = field(default_factory=PipelineRun)
     started: float = field(default_factory=time.perf_counter)
+    trace: Span = NULL_SPAN  # the Langfuse trace of this turn (no-op when tracing is off)
 
     @property
     def is_patient(self) -> bool:
@@ -51,3 +55,9 @@ class TurnContext:
     @property
     def patient_key(self) -> Optional[str]:
         return self.plan.patient_key
+
+    def llm_config(self, span: Span) -> dict:
+        """LangChain config so an agent's LLM call is recorded under ``span`` with the user's role and session."""
+        return span.langchain_config(tags=[self.session.role.value],
+                                     metadata={"user": self.session.username, "session_id": self.session.session_id,
+                                               "patient": self.patient_key or ""})

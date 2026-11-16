@@ -163,6 +163,15 @@ def pattern_indicators(conditions: Sequence[str], inconsistencies: Sequence[str]
     return out
 
 
+def ai_specialist_indicators(an: AnalysisResult) -> List[RiskIndicator]:
+    """AI specialists may only RAISE the risk: urgent -> MODERATE, stat / emergency -> HIGH (never lower anything)."""
+    if an.ai is None:
+        return []
+    return [RiskIndicator(indicator=f"AI flagged as {'stat' if level == 'HIGH' else 'urgent'}: {text[:160]}", level=level,
+                          category="ai_specialist", source=agent, escalate=level == "HIGH")
+            for level, text, agent in an.ai.urgent()]
+
+
 def assessment(indicators: List[RiskIndicator]) -> RiskAssessment:
     """The overall level is the most severe indicator; any escalating indicator (or HIGH/CRITICAL) escalates."""
     ind = sorted(indicators, key=lambda i: -LEVELS.index(i.level))
@@ -181,6 +190,7 @@ class RiskDetectionAgent:
             *symptom_indicators(ext.symptoms, ext.new_symptoms),
             *imaging_indicators(an.imaging),
             *medication_indicators(an.drug_alerts, an.medication_alerts),
-            *allergy_history_indicators(patient),
+            *(allergy_history_indicators(patient) if an.allergy_record_visible else []),
             *pattern_indicators(an.possible_conditions, an.inconsistencies, ext.quality.low_confidence),
+            *ai_specialist_indicators(an),
         ])

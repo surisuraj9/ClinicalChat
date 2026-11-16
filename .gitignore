@@ -11,3 +11,4 @@ data/audit/
 data/exports/
 *.egg-info/
 data/state/
+build/

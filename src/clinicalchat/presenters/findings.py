@@ -1,13 +1,16 @@
-"""Short summaries of what the three rule-based agents found, for the live progress lines and the AI prompts."""
+"""Short summaries of what the agents found (rule-based steps and the AI specialists), for the live progress lines,
+the case views and the AI prompts."""
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import AbstractSet, List, Optional, Sequence
 
 from clinicalchat.agents.analysis import AnalysisResult
 from clinicalchat.agents.extraction import ExtractionResult
+from clinicalchat.agents.specialists.ai import SpecialistReport
 from clinicalchat.domain.models import PatientProfile
 from clinicalchat.domain.risk import LEVEL_BADGE, RiskAssessment
+from clinicalchat.domain.roles import AGENT_LABELS, AgentName
 from clinicalchat.services.router import RoutePlan
 
 
@@ -100,3 +103,38 @@ def risk_text(risk: RiskAssessment, is_patient: bool) -> str:
 def risk_brief(risk: RiskAssessment) -> str:
     lines = [f"Risk level {risk.risk_level}, urgency {risk.urgency}, escalate={risk.escalate}"]
     return "\n".join(lines + [f"- [{i.level}] {i.indicator}" for i in risk.indicators[:10]])
+
+
+URGENCY_ICON = {"emergency": "🔴", "stat": "🔴", "urgent": "🟠", "routine": "🟢"}
+ALL_SPECIALISTS = frozenset({"lab", "radiology", "allergy"})
+SPECIALIST_OF = {"lab": AgentName.LAB_INTERPRETER, "radiology": AgentName.RADIOLOGY_ANALYZER,
+                 "allergy": AgentName.ALLERGY_SAFETY}
+
+
+def _urgency(value: str) -> str:
+    return f"{URGENCY_ICON.get(value.strip().lower(), '⚪')} {value}"
+
+
+def specialists_text(report: SpecialistReport, show: AbstractSet[str] = ALL_SPECIALISTS) -> str:
+    """The AI specialists' structured outputs (course Pydantic models) as markdown for staff.
+    ``show`` limits it to the specialists the viewer's role may see (lab / radiology / allergy)."""
+    out: List[str] = []
+    if report.lab and "lab" in show:
+        out += [f"- 🧪 **{i.test_name}** {i.result_value} · {i.status} · {_urgency(i.urgency)} · conf {i.confidence:.0%} — "
+                f"{i.clinical_significance}" + (f" _Causes:_ {', '.join(i.potential_causes[:3])}." if i.potential_causes else "")
+                + (f" _Next:_ {'; '.join(i.recommended_actions[:3])}" if i.recommended_actions else "")
+                for i in report.lab.interpretations]
+    if report.radiology and "radiology" in show:
+        out += [f"- 🩻 **{s.study_type} — {s.body_region}** · {_urgency(s.urgency)} · conf {s.confidence:.0%} — {s.impression}"
+                + (f" _Differential:_ {', '.join(s.differential_diagnoses[:3])}." if s.differential_diagnoses else "")
+                + (f" _Next:_ {'; '.join(s.recommendations[:3])}" if s.recommendations else "")
+                for s in report.radiology.studies]
+    if report.allergy and "allergy" in show:
+        out += [f"- 🛡️ **{a.allergen}** ({a.category}) · {a.severity} · conf {a.confidence:.0%} — avoid "
+                f"{', '.join(a.cross_reactivities[:4]) or 'n/a'}; safe: {', '.join(a.safe_alternatives[:3]) or 'n/a'}. "
+                f"_Emergency:_ {a.emergency_protocol}"
+                for a in report.allergy.assessments]
+    allowed = {AGENT_LABELS[SPECIALIST_OF[key]] for key in show}
+    out += [f"- ⚠️ {label} unavailable: {err[:120]}" for label, err in report.errors.items() if label in allowed]
+    note = "_AI opinions — the rule-based findings above stay authoritative; AI urgency can only raise the risk._"
+    return ("\n".join(out) + "\n" + note) if out else "- The AI specialists had nothing to add."

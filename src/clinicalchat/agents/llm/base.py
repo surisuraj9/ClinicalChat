@@ -68,7 +68,7 @@ class LLMAgent:
         try:
             message = self._call(self._inputs(variables), self._config(config))
             result.cache_hit = bool((getattr(message, "response_metadata", None) or {}).get("cache_hit"))
-            output, ok = parse_output(StrOutputParser().invoke(message), self.output_model, self.text_field)
+            output, ok = self._parse(StrOutputParser().invoke(message))
             result.output, result.parsed = output.model_dump(), ok
         except Exception as exc:  # a backend failure must not crash the chat
             log.exception("%s failed", self.name.value)
@@ -110,8 +110,12 @@ class LLMAgent:
         result.latency_ms = int((time.perf_counter() - start) * 1000)
         yield "done", result
 
+    def _parse(self, text: str) -> Tuple[BaseModel, bool]:
+        """Reply text -> (output model, parsed_ok). Agents with nested outputs override this."""
+        return parse_output(text, self.output_model, self.text_field)
+
     def _final(self, text: str) -> Tuple[BaseModel, bool]:
-        output, ok = parse_output(text, self.output_model, self.text_field)
+        output, ok = self._parse(text)
         if not ok:  # cut off by the output cap: keep the complete fields that were written
             partial = _partial_json(text)
             if isinstance(partial, dict) and partial.get(self.text_field):

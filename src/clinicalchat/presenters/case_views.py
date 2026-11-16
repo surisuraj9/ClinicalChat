@@ -1,12 +1,14 @@
-"""How a case is shown to each care-team role (RBAC: the radiologist sees imaging + allergies only)."""
+"""How a case is shown to each care-team role (RBAC: the radiologist sees imaging + contrast-safety alerts only)."""
 
 from __future__ import annotations
 
 from typing import Any, Callable, Dict
 
+from clinicalchat.agents.specialists.ai import SpecialistReport
 from clinicalchat.domain import workflow as wf
 from clinicalchat.domain.risk import LEVEL_ICON
 from clinicalchat.domain.roles import Role
+from clinicalchat.presenters.findings import ALL_SPECIALISTS, specialists_text
 
 Case = Dict[str, Any]
 
@@ -29,6 +31,18 @@ def _radiology(pay: dict) -> str:
     reads = (pay.get("radiology") or {}).get("reads") or []
     return "".join(f"\n\n**🩻 Radiology read — {r['reader']}** ({r['at']}): _{r['verdict']}_"
                    + (f"\n> {r['report']}" if r.get("report") else "") for r in reads)
+
+
+def _ai_specialists(pay: dict, show=ALL_SPECIALISTS) -> str:
+    """The course AI specialists' opinions, limited to the record types the viewer's role may see."""
+    data = pay.get("ai_specialists")
+    if not data:
+        return ""
+    report = SpecialistReport.model_validate(data)
+    shown = {k for k in show if getattr(report, k) is not None}
+    if not shown:
+        return ""
+    return "\n\n**🧠 AI specialists (course agents)**\n" + specialists_text(report, shown)
 
 
 def _triage(pay: dict) -> str:
@@ -62,14 +76,12 @@ def _imaging(pay: dict) -> str:
 
 
 def radiologist_view(case: Case, patient_label: str) -> str:
-    """Imaging + allergies / contrast only (no lab results, no full AI insight)."""
+    """Imaging + the contrast-safety alert only (no lab results, no allergy record, no full AI insight)."""
     pay = case["payload"]
     md = _head(case, patient_label) + _imaging(pay)
-    allergies = pay.get("allergies") or []
-    md += "\n**⚠️ Allergies:** " + (", ".join(allergies) if allergies else "none recorded")
     alerts = pay.get("contrast_alerts") or []
     md += "\n\n**💉 Iodinated contrast check:** " + ("\n" + "\n".join(f"- {a}" for a in alerts) if alerts else "no allergy / interaction alert")
-    md += _radiology(pay) + _timeline(pay)
+    md += _ai_specialists(pay, {"radiology"}) + _radiology(pay) + _timeline(pay)
     return md + "\n\n_Choose a verdict, write your read on the left and press **🩻 Submit read** — it goes to the care coordinator._"
 
 
@@ -85,7 +97,7 @@ def coordinator_view(case: Case, patient_label: str) -> str:
         md += "\n\n**AI-suggested possibilities:** " + ", ".join(map(str, pay["possible_conditions"][:5]))
     if ins.get("next_steps"):
         md += "\n\n**Suggested next steps:** " + "; ".join(map(str, ins["next_steps"][:5]))
-    md += _radiology(pay) + _timeline(pay)
+    md += _ai_specialists(pay) + _radiology(pay) + _timeline(pay)
     suggested = wf.suggested_priority(case["risk_level"])
     return md + (f"\n\n**Suggested priority:** {wf.PRIORITY_ICON[suggested]} {suggested} (from risk {case['risk_level']})"
                  "\n\n_Set the priority, pick a clinician on the left and press **🧭 Route to clinician**._")
@@ -113,7 +125,7 @@ def clinician_view(case: Case, patient_label: str) -> str:
         md += "\n> 🟠 **Review Required** — " + "; ".join(pay["review_reasons"])
     if pay.get("facts"):
         md += "\n\n**🔬 Deterministic findings**\n```\n" + pay["facts"][:1500] + "\n```"
-    md += _insight(pay) + _radiology(pay) + _triage(pay)
+    md += _ai_specialists(pay, {"lab", "allergy"}) + _insight(pay) + _radiology(pay) + _triage(pay)
     md += ("\n\n---\n**💬 Shown to the patient as an AI assessment (latest):**\n\n"
            + "\n".join("> " + line for line in case["patient_draft"].splitlines()))
     if pay.get("guard_issues"):

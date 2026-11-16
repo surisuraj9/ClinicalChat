@@ -9,7 +9,7 @@ Allergy reports do not go to the radiologist; the radiologist only sees allergie
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from clinicalchat.domain.clock import local_minute
 from clinicalchat.domain.risk import highest
@@ -190,6 +190,14 @@ def clinician_review(case: Dict[str, Any], *, reviewer: str, approve: bool, note
         reviewer, "Confirmed the assessment — case closed" if approve else "Asked the patient for more information"))
     return {"status": VALIDATED if approve else RETURNED, "reviewer": reviewer, "review_note": note,
             "final_message": final, "reviewed": local_minute(), "delivered": False, "payload": pay}
+
+
+def attach_specialists(payload: Dict[str, Any], report: Dict[str, Any], urgent: Sequence[str] = ()) -> None:
+    """The course AI specialists' structured opinions (lab / radiology / allergy), shown per role in the case views.
+    Findings the AI called stat / emergency become a "Review Required" reason (they never lower anything)."""
+    payload["ai_specialists"] = report
+    reasons = payload.setdefault("review_reasons", [])
+    reasons += [r for r in (f"AI specialist flagged: {u[:140]}" for u in urgent) if r not in reasons]
 
 
 def attach_insight(payload: Dict[str, Any], insight: Optional[Dict[str, Any]], error: str = "") -> None:

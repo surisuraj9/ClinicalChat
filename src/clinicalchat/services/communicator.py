@@ -14,6 +14,7 @@ from clinicalchat.domain.roles import AGENT_LABELS, AgentName
 from clinicalchat.presenters.answers import patient_assessment_markdown, staff_draft_markdown
 from clinicalchat.services.answer_writer import AnswerWriter
 from clinicalchat.services.cases import CaseFiler
+from clinicalchat.services.observability import end_agent_span, guard_span
 from clinicalchat.services.patients import PatientDirectory
 from clinicalchat.services.turn import TurnContext
 
@@ -31,11 +32,14 @@ class Communicator:
         question = question or ctx.question
         yield Event("status", f"{LABEL} — writing", "Writing a plain-language explanation (AI)…", "pending",
                     "agent-communication")
+        span = ctx.trace.child("patient-communication", as_type="agent", input={"question": question},
+                               metadata={"risk_level": risk_level, "for_patient": ctx.is_patient})
         com = yield from self.writer.write(
-            "💬 Writing your answer…" if ctx.is_patient else f"{LABEL} — writing…", ctx.session, abnormal,
+            "💬 Writing your answer…" if ctx.is_patient else f"{LABEL} — writing…", ctx.llm_config(span), abnormal,
             question=question, patient=self.patients.summary(ctx.patient_key),
             risk=f"{risk_level}: {PATIENT_GUIDANCE[risk_level]}", insight=json.dumps(insight, ensure_ascii=False)[:6000])
         ctx.run.llm.append(com)
+        end_agent_span(span, com)
         yield Event("status", f"{LABEL} — {'failed' if com.error else 'done'}", com.timing(), "done", "agent-communication")
         for_patient = ctx.is_patient and ctx.patient_key
         if com.error:
@@ -47,6 +51,7 @@ class Communicator:
             return
         draft = communication_markdown(com.output or {})
         issues = check_patient_text([draft], abnormal)
+        guard_span(ctx.trace, draft, issues)
         summary = str((com.output or {}).get("message", ""))
         if not for_patient:
             md = staff_draft_markdown(draft, issues)

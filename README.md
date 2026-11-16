@@ -7,10 +7,12 @@ It runs the **5-agent clinical workflow** from the course design:
 | Step | Agent | Kind | What it does |
 |---|---|---|---|
 | 1 | 📄 **Data Extraction** | rules | Parses uploads (docx/pdf/txt/xlsx/image + OCR), classifies the report, scores extraction quality, lists missing or ambiguous data, and selects the records relevant to the question. |
-| 2 | 🔬 **Clinical Analysis** | rules + KG | Contains the problem-statement specialists: **Lab Interpreter** (reference ranges, patterns), **Radiology Analyzer** (findings, red flags) and **Allergy Safety** (NetworkX cross-reactivity, drug checks). Adds a symptom → condition differential and a symptom/report consistency check. |
+| 2 | 🔬 **Clinical Analysis** | rules + KG | Contains the problem-statement specialists: **Lab Interpreter** (reference ranges, patterns), **Radiology Analyzer** (findings, red flags) and **Allergy Safety** (NetworkX cross-reactivity, drug checks). Adds a symptom → condition differential and a symptom/report consistency check. Optionally adds the course's three **AI specialists** (Lab Interpreter, Radiology Analyzer, Allergy Safety — structured Pydantic output, in parallel, role-scoped; AI urgency can only raise the risk). |
 | 3 | 🚨 **Risk Detection** | rules | LOW / MODERATE / HIGH / CRITICAL from critical labs, imaging red flags, red-flag symptoms and multiple conditions; decides escalation. |
 | 4 | 💡 **Insight Generation** | LLM (1 call) | Structured insight, possible conditions, next steps, missing data and a confidence score. Low confidence, missing data, contradictions or escalation → **Review required**. |
 | 5 | 💬 **Patient Communication** | LLM (1 call) | Plain-language explanation checked by a deterministic guard (no doses, no definitive diagnosis, no self-medication). Shown to the patient **immediately** as an AI assessment (risk, AI-predicted possible conditions, confidence) with a **case ID**; wording that fails the guard is withheld until a clinician checks it. |
+
+The project follows the course's Week 1–8 notebooks — see [docs/COURSE_ALIGNMENT.md](docs/COURSE_ALIGNMENT.md) for the week-by-week mapping.
 
 An **agent strip** above the chat shows each agent's live state (queued, working, done, skipped, not permitted), and the chat shows a collapsible **Agent activity** log plus "🔎 What the agents found".
 
@@ -61,7 +63,7 @@ Any other personal question ("what do my reports mean?", "is it serious?") is ju
 
 - Routing, extraction, clinical analysis and risk detection use **no LLM calls**.
 - **Patient question = 1 call** (Communication, fast model), whatever it is. Communication works from the automatic findings, or from the last Insight if one exists. When a case is opened, Insight (strong model) is written **in the background** for the care team, and the patient does not wait for it. Insight is reused while the patient's reports, symptoms/allergies, radiologist reads and risk level are unchanged.
-- Staff question = **1 call** (Insight). General question = **1 call**, or **0** if a same or similar question was answered in the last 7 days. "Explain this to the patient" = **1 call**.
+- Staff question = **1 call** (Insight) + **1 per AI specialist** that applies (in parallel; cached because the specialist input does not depend on the question's wording). General question = **1 call**, or **0** if a same or similar question was answered in the last 7 days. "Explain this to the patient" = **1 call**.
 - Responses are cached in SQLite, so asking the same question again is instant and free.
 
 ### Response time
@@ -73,6 +75,7 @@ Any other personal question ("what do my reports mean?", "is it serious?") is ju
 | AI answer — OpenAI (`gpt-4.1-mini`, streamed) | **measured:** first words 0.9–1.8 s, finished 2.2–3.3 s |
 | Care-team Insight — OpenAI (`gpt-4.1`, background) | ~3 s after the patient's answer; the patient never waits for it |
 | Repeated / similar general question | instant (FAQ cache, no AI) |
+| Staff question with AI specialists (`gpt-4.1-mini`, parallel) + Insight | **measured:** 8.5–10 s first time, ~5 s when the specialists are cached |
 
 What makes it fast:
 - **One AI call per patient question.** The care-team Insight runs in the background.
@@ -91,7 +94,15 @@ cp .env.example .env && chmod 600 .env   # .env is git-ignored
 
 > ⚠️ Never put real keys in `.env.example`. It is committed to git.
 
-With the Langfuse keys set, every AI call is traced to Langfuse (agent name, model, prompt, tokens, latency). The JSONL audit log in `data/audit/` is always on.
+With the Langfuse keys set, every question becomes one Langfuse trace: a span per agent step, tool (knowledge graph, vector search, embeddings, web search) and AI call (model, prompt, tokens, latency), plus scores (`insight_confidence`, `lab_interpreter_confidence`, …, `risk_level`, `review_required`, `rbac_blocked`). Uploads and care-team actions are traced too. The JSONL audit log in `data/audit/` is always on.
+
+### AI specialists (course Week 4)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SPECIALIST_AGENTS` | `auto` | `auto` = on when `OPENAI_API_KEY` is set · `llm` = always · `rules` = off (rule-based analysis only) |
+| `OPENAI_SPECIALIST_MODEL` | `gpt-4.1-mini` | Same output as the course's `gpt-4o-mini`, measured ~2.5× faster here |
+| `SPECIALIST_MAX_TOKENS` | `900` | Output cap per specialist |
 
 ### 🌐 Web search (Tavily, trusted sites only)
 
@@ -136,13 +147,15 @@ src/clinicalchat/
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Diagrams: system context, layers, DI wiring, agent pipeline, question sequence, upload flow, case states, deployment; SOLID mapping |
 | [docs/FILE_GUIDE.md](docs/FILE_GUIDE.md) | Every file: what it does, who calls it, and how |
 | [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | Plain-English tour of the agents and the tools they use |
+| [docs/COURSE_ALIGNMENT.md](docs/COURSE_ALIGNMENT.md) | Week 1–8 course notebooks → files in this project |
+| [deployment/README.md](deployment/README.md) | Step-by-step AWS EC2 deployment (systemd, port 8000) |
 
-| Role | Agents | Data |
+| Role | Agents | Record types (course RBAC) |
 |---|---|---|
-| Patient | all 5 (Communication output reviewed) | own record only; can sign up and upload |
-| Clinician | 1–4, plus 5 for "explain this to the patient" | any patient; reviews patient cases |
-| Radiologist | 1–4 | imaging + allergy safety |
-| Care Coordinator | 1–4 | care summaries across specialties |
+| Patient | all 5 (Communication output reviewed) | own record only (all types); can sign up and upload |
+| Clinician | 1–4, plus 5 for "explain this to the patient" | lab, allergy, patient record, reference; radiology hand-over notes on assigned cases |
+| Radiologist | 1–4 | radiology, reference; the iodinated-contrast safety alert is still shown |
+| Care Coordinator | 1–4 | all |
 
 ## Demo accounts
 
@@ -150,8 +163,8 @@ The password for all accounts is `demo@123` (change it with `DEMO_PASSWORD`).
 
 | Username | Role | Notes |
 |---|---|---|
-| `dr.sharma` / `dr.menon` | Clinician | All agents, any patient; **Review queue** for cases assigned to them |
-| `dr.iyer` | Radiologist | Imaging and allergy (contrast safety) records only; **Imaging queue** |
+| `dr.sharma` / `dr.menon` | Clinician | All agents, any patient (lab, allergy and patient records); **Review queue** for cases assigned to them |
+| `dr.iyer` | Radiologist | Imaging records only (plus the contrast-safety alert); **Imaging queue** |
 | `coord.thomas` | Care Coordinator | All records, operational answers; **Triage queue** and case board |
 | `ananya.rao` / `rahul.mehta` | Patient | Own lab record only, simplified answers |
 | `riya.das` | Patient | Own record (sulfa allergy) |
@@ -186,6 +199,22 @@ You can also ask from the terminal:
 .venv/bin/clinicalchat ask "Check for drug allergies before prescribing ibuprofen." --user dr.sharma --patient sneha-gupta-42
 ```
 
+### REST API
+
+The same assistant is available over HTTP (log in with the same username / password; Swagger UI at `/docs`):
+
+```bash
+curl -s localhost:7860/api/health
+curl -s -u dr.sharma:demo@123 localhost:7860/api/status
+curl -s -u dr.sharma:demo@123 -H 'content-type: application/json' \
+     -d '{"query": "Interpret her kidney function results", "patient": "ananya-rao-54"}' localhost:7860/api/query
+curl -s -u ananya.rao:demo@123 localhost:7860/api/allergy/latex
+```
+
+`/api/query` returns the answer, risk level, agents that ran, any safety banner and the Langfuse `trace_id`. Pass `session_id` back for follow-up questions.
+
+The **🛡️ Allergy Safety Check** tile in the sidebar shows the same allergy card in the chat.
+
 Tests use a fake LLM, so they make no real calls:
 
 ```bash
@@ -202,16 +231,20 @@ clinicalchat reset-patient robin.hood --delete-login --yes
 
 This removes the patient's uploads, search-index chunks, symptoms/allergies, cases and their review history, the cached insight and chat exports. Dataset records and other patients are not touched. The JSONL audit log is append-only and is kept.
 
+## Deploy (AWS EC2)
+
+See [deployment/README.md](deployment/README.md): launch an Ubuntu EC2 instance, clone the repo, run `bash deployment/ec2-setup.sh`, put the keys in `.env`, and the app runs as the `clinicalchat` systemd service on **port 8000**. Stopping the service lets background care-team work finish and flushes Langfuse traces.
+
 ## Docker
 
 ```bash
 docker build -t clinicalchat .
-docker run -p 7860:7860 -e OPENAI_API_KEY=sk-... -v clinicalchat-state:/app/data/state clinicalchat
+docker run -p 8000:8000 --env-file .env -e PORT=8000 -v clinicalchat-data:/app/data clinicalchat
 ```
 
-Signed-up users, uploads, cases and review feedback live in `data/state/clinicalchat.db` (git-ignored); mount it as a volume to keep them across restarts.
+Signed-up users, uploads, cases and review feedback live in `data/state/clinicalchat.db` (git-ignored); the volume keeps them across restarts.
 
-`GET /health` returns `{"status": "ok", ...}`; load balancers can use it for health checks.
+`GET /api/health` returns `{"status": "ok"}`; load balancers and the Docker `HEALTHCHECK` use it. `GET /health` (no log-in) also reports the model, web search and tracing status.
 
 ## Data
 

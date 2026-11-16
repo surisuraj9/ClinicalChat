@@ -13,6 +13,7 @@ from clinicalchat.domain.conversation import ChatSession
 from clinicalchat.domain.personas import PERSONAS, Persona
 from clinicalchat.domain.roles import Role, policy
 from clinicalchat.ingestion.uploads import MAX_UPLOAD_FILES
+from clinicalchat.presenters.allergy import allergy_card_markdown
 from clinicalchat.web import components, content
 from clinicalchat.web.chat_renderer import render
 from clinicalchat.web.sidebar import Sidebar, has_queue
@@ -159,6 +160,23 @@ class UIController:
             s.selected_patient = s.last_patient
             pick = gr.update(value=s.last_patient)
         return (export, pick, self.sidebar.patient_card(s), self.sidebar.my_cases(s), *self._queue_updates(s))
+
+    def allergy_check(self, allergen: str, history: History, s: Optional[ChatSession]):
+        """🛡️ Allergy Safety Check tile: knowledge-graph cross-reactivity card posted into the chat (no AI)."""
+        allergen = (allergen or "").strip()
+        history = list(history or [])
+        if not allergen or s is None:
+            return history, ""
+        kg = self.c.kb.kg
+        trace = self.c.tracer.trace("allergy-safety-check", user_id=s.username, session_id=s.session_id,
+                                    tags=["allergy-check", s.role.value], input={"allergen": allergen})
+        with trace.step("knowledge-graph", as_type="tool", input={"allergen": allergen}) as span:
+            card = kg.allergy_safety_card(allergen)
+            span.update(output=card)
+        trace.end({"allergen": card["allergen"], "cross_reactive": len(card["cross_reactive_allergens"])})
+        history.append({"role": "user", "content": f"🛡️ Allergy safety check: **{allergen}**"})
+        history.append({"role": "assistant", "content": allergy_card_markdown(card, kg.known_allergens())})
+        return history, ""
 
     def clear(self, s: Optional[ChatSession]):
         if s is not None:

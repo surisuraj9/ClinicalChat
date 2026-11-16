@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from clinicalchat.container import Container, get_container
 from clinicalchat.infrastructure.llm.models import describe_llm, warm_up
+from clinicalchat.web.api import api_router
 from clinicalchat.web.content import login_message
 from clinicalchat.web.controller import UIController
 from clinicalchat.web.layout import build_ui
@@ -33,7 +35,20 @@ def create_app(container: Optional[Container] = None) -> FastAPI:
     container = container or get_container()
     settings = container.settings
     auth_enabled = os.getenv("UI_AUTH", "on").lower() not in OFF
-    app = FastAPI(title="ClinicalChat", docs_url=None, redoc_url=None)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        # graceful stop (systemd / Ctrl+C): finish background care-team insights, then send the last traces
+        try:
+            await run_in_threadpool(container.insight.drain, 60)
+        except Exception as exc:  # a failed background job must not block the shutdown
+            logging.getLogger(__name__).warning("Background work did not finish cleanly: %s", exc)
+        container.tracer.shutdown()
+
+    app = FastAPI(title="ClinicalChat API", lifespan=lifespan, docs_url="/docs", redoc_url=None,
+                  description="Multi-agent clinical decision support. Log in with the same username / password as the UI.")
+    app.include_router(api_router(container))
 
     @app.middleware("http")
     async def force_light_theme(request: Request, call_next):

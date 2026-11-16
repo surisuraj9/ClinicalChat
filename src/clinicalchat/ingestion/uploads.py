@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple
 
 from clinicalchat.domain.models import ClinicalDocument, Domain, LabResult, Section
 from clinicalchat.ingestion.dates import date_from_fields, date_from_text
-from clinicalchat.ingestion.lab_tables import make_lab_result
+from clinicalchat.ingestion.lab_tables import make_lab_result, parse_pipe_lines
 from clinicalchat.ingestion.loaders import load_document
 from clinicalchat.ingestion.sectioning import split_sections
 
@@ -107,6 +107,21 @@ def _report_kind(report_type: str, drafts: list) -> Tuple[str, Domain]:
     labs = [r for d in drafts for r in d.lab_results]
     text = "\n".join(d.text for d in drafts)
     return classify(text, len(labs), bool(labs) and all("ige" in r.parameter.lower() for r in labs))
+
+
+def reparse_generic_upload(doc: ClinicalDocument) -> bool:
+    """Re-read lab values from an upload that was filed as a generic record with none (e.g. stored by an older
+    parser), and re-classify it. Returns True when the document changed."""
+    if doc.origin != "upload" or doc.domain != Domain.PATIENT_RECORD or any(s.lab_results for s in doc.sections):
+        return False
+    for s in doc.sections:
+        s.lab_results = parse_pipe_lines(s.text.splitlines()) or free_text_labs(s.text)
+    labs = [r for s in doc.sections for r in s.lab_results]
+    if not labs:
+        return False
+    text = "\n".join(s.text for s in doc.sections)
+    doc.category, doc.domain = classify(text, len(labs), all("ige" in r.parameter.lower() for r in labs))
+    return True
 
 
 def _sections(drafts: list, doc_id: str, title: str, patient_key: str, patient_name: str) -> List[Section]:

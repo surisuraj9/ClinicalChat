@@ -74,20 +74,25 @@ class ChatService:
         context_patient = session.selected_patient or session.last_patient  # staff follow-ups keep the patient
         current = session.own_patient or context_patient
         has_insight = bool(session.last_insight and session.last_insight.get("patient_key") == current)
-        plan = self.router.route(question, session.role, session_patient=context_patient,
-                                 own_patient=session.own_patient, has_last_insight=has_insight)
+        trace = self.recorder.start(question, session)
+        with trace.step("router", input={"question": question, "role": session.role.value}) as span:
+            plan = self.router.route(question, session.role, session_patient=context_patient,
+                                     own_patient=session.own_patient, has_last_insight=has_insight)
+            span.update(output=plan.as_dict())
         ctx = TurnContext(question, session, plan, Turn(question=question, role=session.role.value,
-                                                        patient_key=plan.patient_key))
+                                                        patient_key=plan.patient_key), trace=trace)
         yield routed_event(plan, self.patients)
-        if plan.blocked:
-            ctx.turn.blocked = plan.blocked
-            yield Event("blocked", "🔒 Access", plan.blocked)
-        else:
-            if plan.mode != "status":
-                yield from self.web.lookup_unknown_drugs(ctx)
-            mode = "case" if plan.mode == "explain" and not has_insight else plan.mode
-            yield from self._handlers[mode](ctx)
-        self.recorder.finish(ctx)
+        try:
+            if plan.blocked:
+                ctx.turn.blocked = plan.blocked
+                yield Event("blocked", "🔒 Access", plan.blocked)
+            else:
+                if plan.mode != "status":
+                    yield from self.web.lookup_unknown_drugs(ctx)
+                mode = "case" if plan.mode == "explain" and not has_insight else plan.mode
+                yield from self._handlers[mode](ctx)
+        finally:
+            self.recorder.finish(ctx)
 
     def run(self, question: str, session: ChatSession) -> List[Event]:
         return list(self.ask(question, session))
@@ -119,5 +124,9 @@ class ChatService:
     def _case(self, ctx: TurnContext) -> Iterator[Event]:
         if ctx.is_patient and ctx.plan.symptoms and ctx.patient_key:
             ctx.run.new_symptoms = self.symptoms.save(ctx.patient_key, ctx.plan.symptoms)
-        yield from self.pipeline.run(ctx)
-        yield from (self.patient.respond(ctx) if ctx.is_patient else self.staff.respond(ctx))
+        if ctx.is_patient:
+            yield from self.pipeline.run(ctx)
+            yield from self.patient.respond(ctx)
+        else:
+            yield from self.pipeline.run(ctx, on_analysed=self.staff.prefetch)
+            yield from self.staff.respond(ctx)

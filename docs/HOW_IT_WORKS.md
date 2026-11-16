@@ -1,5 +1,5 @@
 > **Generated**: 2026-11-16 04:21 UTC
-> **Updated**: 2026-11-16 04:21 UTC
+> **Updated**: 2026-11-16 15:30 UTC
 > **Project**: ClinicalChat — multi-agent clinical chatbot (HealthCare capstone)
 > **Status**: Final
 
@@ -45,6 +45,7 @@ Think of ClinicalChat as a small clinic.
 ### 📄 1. Data Extraction: "the records clerk"
 - **Job:** find the right papers in your file for this question. A kidney question needs kidney reports, not your X-ray.
 - **How:** it looks up your documents (dataset and uploads), keeps only the kinds your role may see, and gives each one a **readability score** from 0 to 1. A blurry photo scores low and is flagged "a clinician should double-check".
+- **If the right kind of report is missing:** say you ask about thyroid medicine but no *lab* report is on file. The clerk then checks your other papers for a TSH value before saying "no data".
 - **Tools:** the document catalog and the quality scorer. No AI.
 
 ### 🔬 2. Clinical Analysis: "four specialists at one desk"
@@ -54,6 +55,17 @@ This agent runs four mini-experts on the papers the clerk found:
 - ⚠️ **Allergy safety.** It checks every medicine you mention or take against your allergies, using the **knowledge graph** (explained below). It knows, for example, that a penicillin allergy also matters for amoxicillin.
 - 🤒 **Symptom reasoner.** It works out which conditions could explain your symptoms. It raises a **"Clinical Inconsistency"** when symptoms and reports disagree, for example "very tired" but a perfectly normal blood count.
 - **Tools:** the knowledge graph and fixed medical rules. No AI.
+
+**Plus three AI second opinions (from the course, Week 4).** After the rule-based check, up to three AI "specialists" read the same reports at the same time and each fills in a fixed form:
+- 🧪 **Lab Interpreter (AI):** for each important lab value — what it means, possible causes, what to do next, how urgent.
+- 🩻 **Radiology Analyzer (AI):** for each scan — findings, impression, possible diagnoses, recommendations, how urgent.
+- 🛡️ **Allergy Safety (AI):** for each allergy — cross-reactions, safe alternatives, what to do in an emergency.
+
+Rules for these second opinions:
+- Each one only sees what the asking person is allowed to see. A radiologist's question never sends lab results to the AI.
+- They can make the risk **higher** (for example "stat" on a lab value), never lower. The rule-based safety checks stay in charge.
+- Doctors see them while they wait (about 4–5 seconds, all three in parallel). For patients they run quietly in the background and are attached to the case for the care team, so the patient's answer is not slower.
+- Switch them off with `SPECIALIST_AGENTS=rules`.
 
 ### 🚨 3. Risk Detection: "the triage nurse"
 - **Job:** decide how urgent it is: **LOW, MODERATE, HIGH or CRITICAL**.
@@ -90,15 +102,17 @@ This agent runs four mini-experts on the papers the clerk found:
 | Tool | What it is, in plain words | Who uses it |
 |------|----------------------------|-------------|
 | **Knowledge graph** (NetworkX) | A "mind map" of medical facts. Dots are things (drugs, allergies, symptoms, conditions, patients). Lines are relationships such as *amoxicillin* —is a→ *penicillin*, or *patient* —allergic to→ *penicillin*. Following the lines answers "is this medicine safe for this person?" without guessing. | Allergy safety, Symptom reasoner, Risk, Router |
-| **Vector search** (ChromaDB + MiniLM) | A library index that finds passages by **meaning**. Searching "sugar levels" also finds "HbA1c" and "glucose". | Records clerk, general answers |
+| **Vector search** (ChromaDB + OpenAI embeddings) | A library index that finds passages by **meaning**. Searching "sugar levels" also finds "HbA1c" and "glucose". Each passage is turned into a list of numbers (an "embedding") by OpenAI `text-embedding-3-small`, or by a small local model when there is no key. | Records clerk, general answers |
 | **OCR** (RapidOCR) | Reads text from scanned PDFs and phone photos of reports. | Upload reader |
 | **Report readers** | Open Word, PDF, Excel and text files, split them per patient and find lab tables with their normal ranges. | Upload, dataset ingestion |
-| **OpenAI** | The language model that writes the two AI texts. Two sizes: strong (gpt-4.1) for doctors, fast (gpt-4.1-mini) for patients. | Agents 4 and 5 |
+| **OpenAI** | The language model that writes the AI texts. Strong (gpt-4.1) for the doctors' note; fast (gpt-4.1-mini) for patients and the three AI specialists. | Agents 4 and 5, AI specialists |
 | **Tavily** | A web search limited to trusted medical sites (WHO, NHS, CDC, MedlinePlus, …). Names and IDs are removed from the question first. | General questions, staff guidelines, unknown medicine names |
 | **SQLite database** | A single-file database holding log-ins, cases, uploads, review notes and caches. | All services |
 | **Caches** | Short-term memory so the same work is not paid for twice: the AI-answer cache, the FAQ memory, the last insight per patient, and web results (kept 7 days). | AI agents, web search |
 | **Guard** | A fixed list of "never say this to a patient" rules. | Every patient-facing text |
-| **Audit log + Langfuse** | A diary of who asked what, which agents ran and how long each took. Langfuse shows it as a timeline in a dashboard. | Every question and action |
+| **Audit log + Langfuse** | A diary of who asked what, which agents ran and how long each took. Langfuse shows every question as a timeline: each agent, each tool (knowledge graph, search, web) and each AI call, with confidence scores. | Every question and action |
+| **Allergy Safety Check** | A box in the sidebar: type an allergen ("latex", "penicillin") and the knowledge graph lists what else to avoid and what is usually safe. No AI. | Everyone |
+| **REST API** | The same assistant for other programs: `POST /api/query` with a username and password returns the answer. Try it at `/docs`. | Developers, the course's Week 8 |
 
 ---
 
@@ -123,7 +137,8 @@ This agent runs four mini-experts on the papers the clerk found:
 ### C. Uploading a report
 1. Attach up to 10 files. Each one is read (with OCR for scans) and checked:
    - if the report carries **another person's name**, it is refused;
-   - if it is already on your record, it is skipped.
+   - if it is already on your record, it is skipped;
+   - lab values are found even when the results table sits below the name / age / sample lines, so the report is filed as a **lab** report.
 2. All new reports go through the agents **together**, giving one answer.
 3. The case goes to the **radiologist** first if it contains scans, otherwise straight to the **coordinator**.
 
@@ -149,6 +164,7 @@ The demo password for all built-in log-ins is shown on the log-in page.
 ## Why it is fast
 
 - Agents 1–3 use no AI, so they finish in **milliseconds**.
+- The three AI specialists run **at the same time**, not one after another, and a doctor's guideline web search runs alongside them.
 - A patient question uses **one** AI call, and the words stream in. The first words arrive in about 1–2 seconds.
 - The doctor's note (💡) is written **in the background** for patients.
 - Anything already answered is reused from memory: the FAQ memory, the previous insight, cached web results and the AI-answer cache.
@@ -170,3 +186,5 @@ The demo password for all built-in log-ins is shown on the log-in page.
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | v1.0 | 2026-11-16 | Copilot | Initial version after the SOLID / layered refactor |
+| v1.1 | 2026-11-16 | Copilot | Course alignment: AI second opinions, embeddings, Langfuse timeline, Allergy Safety Check, REST API |
+| v1.2 | 2026-11-16 | Copilot | Uploaded lab reports filed correctly; the records clerk checks other papers before saying "no data" |

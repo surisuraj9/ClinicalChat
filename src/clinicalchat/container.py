@@ -19,14 +19,14 @@ from clinicalchat.agents.risk import RiskDetectionAgent
 from clinicalchat.config import Settings, get_settings
 from clinicalchat.infrastructure.audit_log import AuditLog
 from clinicalchat.infrastructure.database import Database
-from clinicalchat.infrastructure.llm.models import FAST, INSIGHT, create_chat_model, install_cache
+from clinicalchat.infrastructure.llm.models import FAST, INSIGHT, SPECIALIST, create_chat_model, install_cache
 from clinicalchat.infrastructure.repositories.caches import FaqCache, InsightCache, WebCache
 from clinicalchat.infrastructure.repositories.cases import CaseRepository
 from clinicalchat.infrastructure.repositories.feedback import FeedbackRepository
 from clinicalchat.infrastructure.repositories.patient_facts import PatientFactRepository
 from clinicalchat.infrastructure.repositories.uploads import UploadRepository
 from clinicalchat.infrastructure.repositories.users import UserRepository
-from clinicalchat.infrastructure.tracing import Tracer
+from clinicalchat.infrastructure.tracing import Tracer, activate
 from clinicalchat.infrastructure.web_search import TavilySearch
 from clinicalchat.services.accounts import AccountService
 from clinicalchat.services.admin import PatientDataAdmin
@@ -41,6 +41,7 @@ from clinicalchat.services.knowledge_base import KnowledgeBase
 from clinicalchat.services.pipeline import AnalysisPipeline
 from clinicalchat.services.responders import GeneralResponder, PatientResponder, StaffResponder
 from clinicalchat.services.router import Router
+from clinicalchat.services.specialist_panel import SpecialistPanel
 from clinicalchat.services.turn_recorder import TurnRecorder
 from clinicalchat.services.uploads import UploadService
 from clinicalchat.services.web_enrichment import WebEnrichment
@@ -79,6 +80,7 @@ class Container:
     care_team: CareTeamService
     insight: InsightService
     pipeline: AnalysisPipeline
+    specialists: SpecialistPanel
     accounts: AccountService
     exporter: SessionExporter
     admin: PatientDataAdmin
@@ -91,14 +93,18 @@ def build_container(settings: Optional[Settings] = None, *, kb: Optional[Knowled
     settings.ensure_dirs()
     repos = Repositories.on(Database(db_path or settings.database_path))
     repos.cases.consolidate_open_cases()
+    tracer = Tracer(settings)
     if kb is None:
-        kb = KnowledgeBase.load(settings, persist=persist)
-        kb.load_user_data(repos.users.all(), repos.facts.all(), repos.uploads.all())
+        with activate(tracer.trace("knowledge-base-load", tags=["startup"])) as span:
+            kb = KnowledgeBase.load(settings, persist=persist)
+            kb.load_user_data(repos.users.all(), repos.facts.all(), repos.uploads.all())
+            span.end(kb.stats())
     if llm is None:
         install_cache(settings)
     insight_llm = llm or create_chat_model(settings, INSIGHT)
     fast_llm = llm or create_chat_model(settings, FAST)
-    audit, tracer = AuditLog(settings.audit_dir), Tracer(settings)
+    specialist_llm = llm or create_chat_model(settings, SPECIALIST)
+    audit = AuditLog(settings.audit_dir)
     web = web or TavilySearch(settings, repos.web)
 
     # agents
@@ -106,27 +112,30 @@ def build_container(settings: Optional[Settings] = None, *, kb: Optional[Knowled
     analysis = ClinicalAnalysisAgent(kb.catalog, kb.patients, kb.kg, kb.safety)
     insight_agent = InsightGenerationAgent(insight_llm)
     communication_agent = PatientCommunicationAgent(fast_llm)
+    specialists = SpecialistPanel(specialist_llm, enabled=settings.specialists_use_llm)
 
     # services
     router = Router(kb.patients, kb.kg)
-    pipeline = AnalysisPipeline(extraction, analysis, RiskDetectionAgent(), kb.patients, kb.safety)
-    enrichment = WebEnrichment(web, kb.patients, kb.kg, tracer)
-    insight = InsightService(insight_agent, kb.patients, kb.records, repos.feedback, repos.cases, repos.insights)
-    writer = AnswerWriter(communication_agent, tracer)
+    pipeline = AnalysisPipeline(extraction, analysis, RiskDetectionAgent(), kb.patients, kb.safety, specialists)
+    enrichment = WebEnrichment(web, kb.patients, kb.kg)
+    insight = InsightService(insight_agent, kb.patients, kb.records, repos.feedback, repos.cases, repos.insights,
+                             specialists)
+    writer = AnswerWriter(communication_agent)
     filer = CaseFiler(repos.cases, repos.uploads, repos.facts, kb.catalog, kb.safety)
     communicator = Communicator(writer, filer, kb.patients)
-    staff = StaffResponder(insight, enrichment, communicator, tracer)
-    patient = PatientResponder(insight, filer, communicator, tracer)
+    staff = StaffResponder(insight, enrichment, communicator)
+    patient = PatientResponder(insight, filer, communicator)
     general = GeneralResponder(writer, enrichment, kb.records, kb.patients, repos.faq)
     symptoms = SymptomRecorder(repos.facts, kb.patients, kb.kg)
-    recorder = TurnRecorder(audit)
+    recorder = TurnRecorder(audit, tracer)
     exporter = SessionExporter(kb.patients, settings.export_dir)
     return Container(
         settings=settings, kb=kb, repos=repos, audit=audit, tracer=tracer, llm=insight_llm, fast_llm=fast_llm, web=web,
         chat=ChatService(router, kb.patients, enrichment, pipeline, staff, patient, general, communicator, symptoms,
                          repos.cases, recorder),
         uploads=UploadService(kb, repos.uploads, router, pipeline, staff, patient, symptoms, recorder),
-        care_team=CareTeamService(repos.cases, repos.feedback, audit), insight=insight, pipeline=pipeline,
+        care_team=CareTeamService(repos.cases, repos.feedback, audit, tracer), insight=insight, pipeline=pipeline,
+        specialists=specialists,
         accounts=AccountService(repos.users, repos.facts, kb.patients, settings.demo_password),
         exporter=exporter,
         admin=PatientDataAdmin(repos.users, repos.uploads, repos.facts, repos.cases, repos.feedback, repos.insights,

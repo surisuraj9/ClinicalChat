@@ -61,6 +61,12 @@ def build_ui(ui: UIController, llm_label: str, auth_enabled: bool = True) -> gr.
                     gr.HTML("<div class='cc-h'>My case updates</div>", padding=False)
                     cases_box = gr.HTML(padding=False)
                 with gr.Column(elem_classes="cc-tile"):
+                    gr.HTML("<div class='cc-h'>🛡️ Allergy Safety Check</div>", padding=False)
+                    with gr.Row(elem_classes="cc-qrow"):
+                        allergen_box = gr.Textbox(placeholder="Allergen, e.g. peanut, penicillin, latex", show_label=False,
+                                                  container=False, scale=3, elem_id="cc-allergen")
+                        allergen_btn = gr.Button("Check", size="sm", scale=0, min_width=80, elem_classes=SECONDARY)
+                with gr.Column(elem_classes="cc-tile"):
                     gr.HTML("<div class='cc-h'>Try asking</div>", padding=False)
                     chips = [gr.Button("", elem_classes="cc-chip", size="sm", visible=False) for _ in range(N_CHIPS)]
             # ---------------- chat: agent strip + conversation + input
@@ -108,6 +114,8 @@ def build_ui(ui: UIController, llm_label: str, auth_enabled: bool = True) -> gr.
         upload_btn.upload(attach_files, [upload_btn, attached, session], [attached, attach_chip, msg])
         attach_chip.change(update_attachments, [attach_chip, attached], [attached, attach_chip, msg], show_progress="hidden")
         clear_btn.click(ui.clear, session, [chatbot, export_btn, strip])
+        allergen_btn.click(ui.allergy_check, [allergen_box, chatbot, session], [chatbot, allergen_box])
+        allergen_box.submit(ui.allergy_check, [allergen_box, chatbot, session], [chatbot, allergen_box])
 
         # ---------------- care-team work queues (radiologist → coordinator → clinician)
         review_pick.change(ui.open_case, [review_pick, chatbot, session], [chatbot, patient_pick, card, priority_pick, verdict_pick])

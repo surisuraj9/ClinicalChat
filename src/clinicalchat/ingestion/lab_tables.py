@@ -21,6 +21,9 @@ _HEADER_VALUE = re.compile(r"\b(result|value|observed)\b", re.IGNORECASE)
 _HEADER_RANGE = re.compile(r"(range|reference|ref\.?|interval|normal)", re.IGNORECASE)
 _HEADER_STATUS = re.compile(r"\b(status|flag|interpretation)\b", re.IGNORECASE)
 _HEADER_UNIT = re.compile(r"\bi?unit\b", re.IGNORECASE)
+_ORDINAL = re.compile(r"^\s*\d+\s*(?:st|nd|rd|th)\b", re.IGNORECASE)  # "1st Trimester" is a label, not a value
+_HEADER_SCAN_ROWS = 15  # report banners (name, age, sample ...) often sit above the results table
+_HEADER_CELL_MAX = 40
 
 # Panic values that require immediate clinician notification (parameter keyword -> (low, high)).
 CRITICAL_LIMITS: List[Tuple[Tuple[str, ...], Optional[float], Optional[float]]] = [
@@ -29,6 +32,7 @@ CRITICAL_LIMITS: List[Tuple[Tuple[str, ...], Optional[float], Optional[float]]] 
     (("potassium",), 2.5, 6.5),
     (("sodium",), 120.0, 160.0),
     (("platelet",), 50.0, 1000.0),  # in 10^3/uL (converted below when needed)
+    (("wbc", "white blood cell", "total leukocyte", "total leucocyte"), 2.0, 30.0),  # in 10^3/uL
     (("troponin",), None, 0.4),
     (("inr",), None, 5.0),
 ]
@@ -63,9 +67,12 @@ def parse_value(text: str) -> Tuple[Optional[float], str]:
     return float(m.group(1)), m.group(2).strip()
 
 
-def _normalise_platelets(param: str, value: float, high: Optional[float]) -> float:
-    # Datasets mix 245,000 /uL and 245 x10^3/uL; compare critical limits in 10^3/uL.
-    if "platelet" in param.lower() and value > 5000:
+def _per_thousand(param: str, value: float) -> float:
+    """Datasets mix 245,000 /uL and 245 x10^3/uL (platelets) or 7,500 /uL and 7.5 x10^3/uL (WBC); critical limits
+    are compared in 10^3/uL."""
+    p = param.lower()
+    if ("platelet" in p and value > 5000) or (any(k in p for k in ("wbc", "white blood", "leukocyte", "leucocyte"))
+                                             and value > 500):
         return value / 1000.0
     return value
 
@@ -81,7 +88,7 @@ def compute_status(param: str, value: Optional[float], low: Optional[float], hig
     p = f"{param.lower()} "
     for keywords, crit_low, crit_high in CRITICAL_LIMITS:
         if any(k in p for k in keywords):
-            v = _normalise_platelets(param, value, high)
+            v = _per_thousand(param, value)
             if crit_low is not None and v < crit_low and status == LabStatus.LOW:
                 return LabStatus.CRITICAL_LOW
             if crit_high is not None and v > crit_high and status == LabStatus.HIGH:
@@ -104,9 +111,10 @@ def _reported_matches(reported: str, status: LabStatus) -> bool:
 
 
 def _find_header(rows: List[List[str]]) -> Optional[int]:
-    for idx, row in enumerate(rows[:3]):
-        joined = " ".join(row)
-        if _HEADER_VALUE.search(joined) and _HEADER_RANGE.search(joined):
+    """A header row has short column titles such as 'Result' and 'Reference range' (not a footnote mentioning them)."""
+    for idx, row in enumerate(rows[:_HEADER_SCAN_ROWS]):
+        titles = [c for c in row if len(c) <= _HEADER_CELL_MAX]
+        if any(_HEADER_VALUE.search(c) for c in titles) and any(_HEADER_RANGE.search(c) for c in titles):
             return idx
     return None
 
@@ -122,7 +130,7 @@ def _read_cells(row: List[str], status_col: Optional[int]) -> Tuple[Optional[flo
             continue
         if value is None:
             v, rest = parse_value(cell)
-            if v is not None and not _RANGE_RE.search(_strip_thousands(cell)):
+            if v is not None and not _RANGE_RE.search(_strip_thousands(cell)) and not _ORDINAL.match(cell):
                 value, value_text, unit = v, cell, rest
                 continue
         if not range_text:
@@ -151,7 +159,8 @@ def parse_lab_table(rows: List[List[str]]) -> List[LabResult]:
         if len(row) < 2 or not row[0]:
             continue
         param = row[0]
-        if param.lower() in {"investigations", "parameter", "test", "result"} or parse_value(param)[0] is not None:
+        if (param.lower() in {"investigations", "parameter", "test", "result"} or parse_value(param)[0] is not None
+                or not re.search(r"[A-Za-z]", param)):
             continue
         value, value_text, unit, low, high, range_text = _read_cells(row, status_col)
         if value is None:

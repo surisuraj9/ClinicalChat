@@ -17,6 +17,21 @@ from clinicalchat.container import build_container
 from clinicalchat.services.knowledge_base import KnowledgeBase
 
 
+SPECIALIST_PAYLOADS = {  # course schemas; confidence 85 checks the lenient "percent -> fraction" parsing
+    "LAB INTERPRETER": {"interpretations": [{
+        "test_name": "Hemoglobin", "result_value": "9.1 g/dL", "status": "LOW", "clinical_significance": "Anaemia",
+        "potential_causes": ["iron deficiency"], "recommended_actions": ["iron studies"], "urgency": "stat",
+        "confidence": 85}]},
+    "RADIOLOGY ANALYZER": {"studies": [{
+        "study_type": "X-ray", "body_region": "Chest", "findings": ["clear lungs"], "impression": "No acute disease",
+        "differential_diagnoses": [], "recommendations": ["none"], "urgency": "routine", "confidence": 0.9}]},
+    "ALLERGY SAFETY": {"assessments": [{
+        "allergen": "Penicillin", "category": "Medication", "severity": "SEVERE", "reactions": ["hives"],
+        "cross_reactivities": ["amoxicillin"], "safe_alternatives": ["azithromycin"],
+        "emergency_protocol": "Epinephrine and call emergency services", "confidence": 0.9}]},
+}
+
+
 class FakeLLM(BaseChatModel):
     """Returns schema-shaped JSON and records every prompt (so tests can count LLM calls)."""
 
@@ -30,7 +45,9 @@ class FakeLLM(BaseChatModel):
         text = "\n".join(str(m.content) for m in messages)
         self.calls.append(text)
         agent = re.search(r"You are the ([A-Z ]+) agent", text).group(1)
-        if agent.startswith("INSIGHT"):
+        if agent in SPECIALIST_PAYLOADS:
+            payload = SPECIALIST_PAYLOADS[agent]
+        elif agent.startswith("INSIGHT"):
             payload = {"answer": "INSIGHT answer", "key_findings": ["finding"], "possible_conditions": ["Anaemia"],
                        "next_steps": ["repeat test"], "additional_data_needed": [], "confidence": 0.8, "sources": []}
         else:
@@ -61,8 +78,8 @@ def fake_llm():
 @pytest.fixture()
 def make_container(kb, tmp_path):
     """Builds the app with a fake model, a fake web search and a throw-away database / audit folder."""
-    def make(llm=None, web=None):
-        settings = Settings(work_dir=tmp_path)
+    def make(llm=None, web=None, **settings_kw):
+        settings = Settings(work_dir=tmp_path, **settings_kw)
         return build_container(settings, kb=kb, llm=llm or FakeLLM(cache=False, calls=[]), web=web or NoWeb(),
                                db_path=tmp_path / "test.db", persist=False)
     return make

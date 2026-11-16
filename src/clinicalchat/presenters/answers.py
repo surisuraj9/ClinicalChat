@@ -84,8 +84,10 @@ def general_answer_footer(sources: Sequence[str]) -> str:
     return md + (f" Sources: {', '.join(sources)}</sub>" if sources else "</sub>")
 
 
-def safety_banner(plan: RoutePlan, patient: Optional[PatientProfile], alerts: Sequence[SafetyAlert]) -> str:
-    """Deterministic medicine-safety lines shown before any AI text (never held back)."""
+def safety_banner(plan: RoutePlan, patient: Optional[PatientProfile], alerts: Sequence[SafetyAlert],
+                  show_allergy_record: bool = True) -> str:
+    """Deterministic medicine-safety lines shown before any AI text (never held back). Roles without access to
+    allergy records (radiologist) still get the alerts for the medicine / contrast they asked about."""
     lines = list(plan.drug_notes)
     for a in alerts:
         icon = "⛔" if a.level == "CONTRAINDICATED" else "⚠️"
@@ -93,7 +95,7 @@ def safety_banner(plan: RoutePlan, patient: Optional[PatientProfile], alerts: Se
     if plan.drugs and not alerts:
         lines.append(f"✅ No allergy or interaction conflict found for **{', '.join(plan.drugs)}**"
                      + ("" if patient else " (select a patient to check their allergies)"))
-    if patient and patient.allergies and (plan.drugs or plan.allergens or Domain.ALLERGY in plan.focus):
+    if show_allergy_record and patient and patient.allergies and (plan.drugs or plan.allergens or Domain.ALLERGY in plan.focus):
         lines.append("🩺 **Documented allergies:** " + "; ".join(
             f"{a.allergen} ({a.severity.lower()}{', ' + ', '.join(a.reactions[:2]) if a.reactions else ''})"
             for a in patient.allergies))

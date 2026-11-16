@@ -1,5 +1,6 @@
 """The care team's actions on a case — 🩻 radiology read, 🧭 triage, 👩‍⚕️ clinician review — plus their work queues and
-the patient's delivery of confirmed answers. Every action is checked by the workflow rules and written to the audit log."""
+the patient's delivery of confirmed answers. Every action is checked by the workflow rules, written to the audit log
+and recorded as a Langfuse trace (who did what to which case)."""
 
 from __future__ import annotations
 
@@ -11,15 +12,23 @@ from clinicalchat.domain.roles import Role
 from clinicalchat.infrastructure.audit_log import AuditLog
 from clinicalchat.infrastructure.repositories.cases import CaseRepository
 from clinicalchat.infrastructure.repositories.feedback import FeedbackRepository
+from clinicalchat.infrastructure.tracing import NULL_TRACER, Tracer
 
 Case = Dict[str, Any]
 
 
 class CareTeamService:
-    def __init__(self, cases: CaseRepository, feedback: FeedbackRepository, audit: AuditLog):
+    def __init__(self, cases: CaseRepository, feedback: FeedbackRepository, audit: AuditLog,
+                 tracer: Tracer = NULL_TRACER):
         self.cases = cases
         self.feedback = feedback
         self.audit = audit
+        self.tracer = tracer
+
+    def _record(self, actor: str, event: Dict[str, Any]) -> None:
+        self.audit.record(event)
+        self.tracer.trace("care-team-action", user_id=actor, tags=["care-team", event["event"]],
+                          input=event).end({"case": event["case"]})
 
     # ------------------------------------------------------------------ actions
     def radiology_read(self, case_id: str, reader: str, verdict: str, report: str) -> Case:
@@ -32,8 +41,8 @@ class CareTeamService:
         payload, status, risk = wf.radiology_read(case, reader=reader, verdict=verdict, report=report.strip(),
                                                   doc_ids=doc_ids)
         case = self.cases.update(case_id, {"payload": payload, "status": status, **({"risk_level": risk} if risk else {})})
-        self.audit.record({"event": "radiology_read", "case": case_id, "reader": reader, "verdict": verdict,
-                           "next": case["status"]})
+        self._record(reader, {"event": "radiology_read", "case": case_id, "reader": reader, "verdict": verdict,
+                              "next": case["status"]})
         return case
 
     def triage(self, case_id: str, coordinator: str, priority: str, clinician: str, note: str = "") -> Case:
@@ -44,8 +53,8 @@ class CareTeamService:
         payload = wf.triage(self.cases.require(case_id), coordinator=coordinator, priority=priority,
                             clinician=doctor.username, clinician_name=doctor.display_name, note=note.strip())
         case = self.cases.update(case_id, {"payload": payload, "status": wf.CLINICIAN})
-        self.audit.record({"event": "triage", "case": case_id, "coordinator": coordinator, "priority": priority,
-                           "clinician": doctor.username})
+        self._record(coordinator, {"event": "triage", "case": case_id, "coordinator": coordinator,
+                                   "priority": priority, "clinician": doctor.username})
         return case
 
     def review(self, case_id: str, reviewer: str, approve: bool, note: str = "", edited_message: str = "") -> Case:
@@ -56,8 +65,8 @@ class CareTeamService:
         self.cases.update(case_id, values)
         topic = ", ".join(case["payload"].get("possible_conditions", [])[:3]) or case["question"][:80]
         self.feedback.add(case_id, reviewer, values["status"], values["review_note"], topic)
-        self.audit.record({"event": "review", "case": case_id, "reviewer": reviewer, "status": values["status"],
-                           "note": values["review_note"], "edited": bool(edited_message.strip())})
+        self._record(reviewer, {"event": "review", "case": case_id, "reviewer": reviewer, "status": values["status"],
+                                "note": values["review_note"], "edited": bool(edited_message.strip())})
         return self.cases.require(case_id)
 
     # ------------------------------------------------------------------ queues and delivery

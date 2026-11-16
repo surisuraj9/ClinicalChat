@@ -76,8 +76,11 @@ def detect_domains(text: str) -> List[Domain]:
     return [d for d, rx in DOMAIN_PATTERNS.items() if re.search(rx, low)]
 
 
-DENIED_HINT = {Role.RADIOLOGIST: "As a radiologist you can work with imaging reports and allergy / contrast safety. "
-                                 "Lab interpretation and full patient records are available to clinicians."}
+DENIED_HINT = {Role.RADIOLOGIST: "As a radiologist you can work with imaging reports (contrast-safety alerts still "
+                                 "appear when you ask about contrast). Lab results, allergy records and full patient "
+                                 "records are available to clinicians.",
+               Role.CLINICIAN: "As a clinician you can work with lab results, allergies and patient records. Imaging "
+                               "is interpreted by the radiologist — their read appears on the patient's case."}
 PRIVACY_BLOCK = ("For privacy, patients can only ask about their own records. "
                  "I can help you with questions about your own health and results.")
 

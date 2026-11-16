@@ -1,5 +1,5 @@
 > **Generated**: 2026-11-16 04:21 UTC
-> **Updated**: 2026-11-16 04:21 UTC
+> **Updated**: 2026-11-16 15:30 UTC
 > **Project**: ClinicalChat — multi-agent clinical chatbot (HealthCare capstone)
 > **Status**: Final
 
@@ -10,6 +10,7 @@ This document covers the system end to end with diagrams: who uses it, how the c
 Companion docs:
 - [FILE_GUIDE.md](FILE_GUIDE.md): every file, who calls it and how.
 - [HOW_IT_WORKS.md](HOW_IT_WORKS.md): the same story in plain English.
+- [COURSE_ALIGNMENT.md](COURSE_ALIGNMENT.md): how the Week 1–8 course notebooks map onto this code.
 
 Every diagram has a Mermaid source in [`diagrams/src/`](diagrams/src) and a rendered PNG in [`diagrams/`](diagrams).
 
@@ -24,6 +25,7 @@ Every diagram has a Mermaid source in [`diagrams/src/`](diagrams/src) and a rend
 - [8. Deployment](#8-deployment)
 - [9. Cross-cutting concerns](#9-cross-cutting-concerns)
 - [10. How SOLID is applied](#10-how-solid-is-applied)
+- [11. Knowledge graph](#11-knowledge-graph)
 - [Revision History](#revision-history)
 
 ---
@@ -32,7 +34,7 @@ Every diagram has a Mermaid source in [`diagrams/src/`](diagrams/src) and a rend
 
 ![System context](diagrams/01-system-context.png)
 
-- **One Python process** runs everything. FastAPI and Gradio serve the UI on port 7860.
+- **One Python process** runs everything. FastAPI serves the Gradio UI and a REST API (`/api/*`, Swagger at `/docs`) on port 7860 locally, 8000 on EC2.
 - **In memory**:
   - the knowledge base built from the dataset and uploads: document catalog, patient directory, NetworkX graph.
 - **On disk**:
@@ -40,9 +42,9 @@ Every diagram has a Mermaid source in [`diagrams/src/`](diagrams/src) and a rend
   - ChromaDB holds the vector index;
   - JSONL files hold the audit log.
 - **External services** are all optional. Each one is switched on by a key in `.env`.
-  - **OpenAI**: the two AI agents.
+  - **OpenAI**: the two AI agents, the three AI specialists and the embeddings (`text-embedding-3-small`; local MiniLM without a key).
   - **Tavily**: search of trusted medical sites, with de-identified queries.
-  - **Langfuse**: traces.
+  - **Langfuse**: one trace per chat turn, with a span per agent / tool and confidence scores.
   - Without OpenAI, answers fall back to the rule-based findings.
 
 ## 2. Layers and dependency rule
@@ -70,7 +72,7 @@ Every diagram has a Mermaid source in [`diagrams/src/`](diagrams/src) and a rend
 
 1. Database, then repositories.
 2. KnowledgeBase.
-3. OpenAI models: the strong `gpt-4.1` and the fast `gpt-4.1-mini`.
+3. OpenAI models: the strong `gpt-4.1` (Insight), the fast `gpt-4.1-mini` (Communication) and the specialist model (`gpt-4.1-mini`, the three course specialists in a `SpecialistPanel`).
 4. Tavily, Tracer, AuditLog.
 5. The agents.
 6. The services: pipeline, insight, writer, case filer, responders, chat, uploads, care team, accounts, admin, export.
@@ -90,12 +92,13 @@ Every class receives its collaborators through `__init__`. As a result:
 | 0 | 🧭 Router | Keywords and RBAC, no AI | Mode (status / general / explain / case), patient, record domains, drugs, symptoms |
 | 1 | 📄 Data Extraction | Rules | The records relevant to the question, and a quality score |
 | 2 | 🔬 Clinical Analysis | Rules and the knowledge graph | Lab, radiology, allergy and symptom findings, plus inconsistencies |
-| 3 | 🚨 Risk Detection | Rules | Risk level LOW to CRITICAL, and whether to escalate |
+| 2b | 🧪 🩻 🛡️ AI specialists (course Week 4) | **AI**, gpt-4.1-mini, up to 3 parallel calls | `LabInterpretation` / `RadiologyFinding` / `AllergyAssessment` for the record types the role may see. Staff: while they wait. Patients: in the background, attached to the case. |
+| 3 | 🚨 Risk Detection | Rules (+ AI urgency, raise only) | Risk level LOW to CRITICAL, and whether to escalate |
 | 4 | 💡 Insight Generation | **AI**, gpt-4.1, one call | A structured clinical summary for staff |
 | 5 | 💬 Patient Communication | **AI**, gpt-4.1-mini, one streamed call | A plain-language answer, checked by the 🛡️ guard |
 
 **AI budget**
-- A staff question costs one call (Insight).
+- A staff question costs one call (Insight), plus one call per AI specialist that applies (cached: the specialist input does not depend on the wording of the question). A guideline question starts its web search as soon as the rule-based findings are ready, in parallel with the specialists.
 - A patient question costs one call (Communication). Insight is either reused from the cache or written in the background for the care team.
 - A status question costs zero calls.
 - A repeated general question costs zero calls, thanks to the FAQ cache.
@@ -140,21 +143,22 @@ The rules live in `domain/workflow.py` as pure functions. They are applied by `s
 
 ![Deployment](diagrams/08-deployment.png)
 
-- **Today**: run it locally with `clinicalchat serve`, or with `docker build` and `docker run`.
-- **Planned on AWS**: run the same image as a container service behind an HTTPS load balancer.
-  - Keys come from a secrets store, never from the image.
-  - `data/` sits on a persistent volume.
-  - The health check is `/health`.
+- **Local**: `clinicalchat serve` (port 7860).
+- **AWS EC2** ([deployment/README.md](../deployment/README.md)): `deployment/ec2-setup.sh` installs Python 3.11 with `uv` and the pinned `deployment/requirements.txt`, builds the corpus and vector index, and installs the `clinicalchat.service` systemd unit on port 8000.
+  - Keys live in `.env` in the app folder (`chmod 600`), never in git or the image.
+  - systemd stops the app with SIGINT: background care-team work finishes and Langfuse traces are flushed before exit.
+  - The health check is `/api/health`.
+- **Docker** (alternative): the `Dockerfile` ingests at build time and exposes port 8000 with a `HEALTHCHECK`.
 
 ## 9. Cross-cutting concerns
 
 | Concern | How it is handled |
 |---------|-------------------|
-| **Access control (RBAC)** | `domain/roles.py` defines per role the agents, record domains and patients allowed. The router blocks access to other patients. Log-in identity is held on the server. |
+| **Access control (RBAC)** | `domain/roles.py` defines per role the agents, record domains and patients allowed (course table: clinician = lab + allergy + patient record; radiologist = radiology; coordinator = all; patient = own record). Retrieval, AI specialists and case views all apply it. The router blocks access to other patients. Log-in identity is held on the server (UI) or checked with HTTP Basic (API). |
 | **Patient safety** | Rule-based allergy and interaction checks run before any AI. The guard blocks doses, definitive diagnoses and "stop your medicine" advice. Emergency guidance is never held back. The patient's instant answer is informational and passes the guard. The care team's message on a case reaches the patient only after a clinician approves it. |
 | **Privacy** | Web queries are de-identified (`domain/privacy.py`) and limited to trusted domains. Keys live only in the git-ignored `.env`. Passwords are hashed with PBKDF2. |
 | **Speed** | Steps 1–3 need no AI. Patients get one streamed AI call. Insight runs in the background. Caches: LLM, FAQ, insight, and web (7 days). The app warms up at start-up. |
-| **Observability** | JSONL audit log (always on). Langfuse spans per AI and web call, tagged with role and session. `/health` reports the model, web search and tracing status. |
+| **Observability** | JSONL audit log (always on). Langfuse: one trace per turn / upload / care-team action, spans per pipeline step, tool (knowledge graph, vector search, embeddings, web) and AI call, plus scores (`*_confidence`, `risk_level`, `review_required`, `rbac_blocked`). `/api/status` reports the models, specialists, web search and tracing status. |
 | **Learning from feedback** | Clinician review notes are stored and added to later Insight prompts. |
 
 ## 10. How SOLID is applied
@@ -171,8 +175,14 @@ Clean-code checks used for the refactor:
 - ruff (pyflakes, bugbear): clean.
 - vulture: no dead code. The remaining hits are LangChain override signatures.
 - radon: no function with D/E complexity.
-- 80 tests pass.
+- 112 tests pass (80 at the time of the refactor; the course-alignment work added specialist, RBAC, knowledge-graph, panic-value, API and parallel-search tests; the upload fix added lab-table, re-read and extraction-fallback tests).
 - Before/after harnesses showed that parsing and knowledge-graph output are byte-identical to the code before the refactor.
+
+## 11. Knowledge graph
+
+![Knowledge graph excerpt](diagrams/09-knowledge-graph.png)
+
+`knowledge/graph.py` builds a NetworkX graph from `knowledge/ontology.py` and the patient records, using the course vocabulary: TEST ─CONFIRMS→ DIAGNOSIS, SYMPTOM ─INDICATES→ DIAGNOSIS, ALLERGEN ─CROSS_REACTIVE→ ALLERGEN, TREATMENT ─TREATS→ DIAGNOSIS, plus safety edges (BELONGS_TO, INTERACTS, CONTRAINDICATES). It answers deterministic questions — `find_diagnoses_for_symptoms`, `get_cross_reactive_allergens`, drug-vs-allergy and drug-vs-condition alerts — for Clinical Analysis, the Allergy Safety Check tile and `GET /api/allergy/{allergen}`. The picture is an excerpt drawn with `kg.to_mermaid(only=…)`.
 
 ---
 
@@ -181,3 +191,5 @@ Clean-code checks used for the refactor:
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | v1.0 | 2026-11-16 | Copilot | Initial version after the SOLID / layered refactor |
+| v1.1 | 2026-11-16 | Copilot | Course alignment: AI specialists, RBAC table, tracing and scores, REST API, EC2 deployment, knowledge-graph section |
+| v1.2 | 2026-11-16 | Copilot | Test count after the upload / lab-parsing fix |

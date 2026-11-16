@@ -7,22 +7,20 @@ from typing import Iterator
 
 from clinicalchat.agents.communication import PatientCommunicationAgent, communication_markdown
 from clinicalchat.agents.guard import blocking, check_patient_text
-from clinicalchat.domain.conversation import ChatSession, Event
-from clinicalchat.infrastructure.tracing import Tracer
+from clinicalchat.domain.conversation import Event
 
 PAUSED = "_Checking the wording before showing it…_"
 CURSOR = " ▍"
 
 
 class AnswerWriter:
-    def __init__(self, agent: PatientCommunicationAgent, tracer: Tracer):
+    def __init__(self, agent: PatientCommunicationAgent):
         self.agent = agent
-        self.tracer = tracer
 
-    def write(self, title: str, session: ChatSession, abnormal: bool, **inputs) -> Iterator[Event]:
+    def write(self, title: str, config: dict, abnormal: bool, **inputs) -> Iterator[Event]:
         """Yields "partial" events while the AI writes; returns the final AgentResult."""
         result, paused = None, False
-        for kind, value in self.agent.stream(config=self.tracer.config_for(session), **inputs):
+        for kind, value in self.agent.stream(config=config, **inputs):
             if kind == "done":
                 result = value
             elif not paused:

@@ -109,6 +109,10 @@ def ingest(settings: Optional[Settings] = None) -> Tuple[List[ClinicalDocument],
     return documents, registry
 
 
+# bump when parsing / lab-status rules change so the cached corpus is rebuilt (2: course WBC panic values)
+CORPUS_VERSION = 2
+
+
 def corpus_path(settings: Settings) -> Path:
     return settings.processed_dir / "corpus.json"
 
@@ -116,6 +120,7 @@ def corpus_path(settings: Settings) -> Path:
 def save_corpus(documents: List[ClinicalDocument], registry: PatientRegistry, settings: Settings) -> Path:
     path = corpus_path(settings)
     payload = {
+        "version": CORPUS_VERSION,
         "documents": [d.model_dump(mode="json") for d in documents],
         "patients": [p.model_dump(mode="json") for p in registry.all()],
     }
@@ -126,8 +131,8 @@ def save_corpus(documents: List[ClinicalDocument], registry: PatientRegistry, se
 def load_corpus(settings: Optional[Settings] = None, rebuild: bool = False) -> Tuple[List[ClinicalDocument], PatientRegistry]:
     settings = settings or get_settings()
     path = corpus_path(settings)
-    if path.exists() and not rebuild:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() and not rebuild else {}
+    if payload.get("version") == CORPUS_VERSION:
         documents = [ClinicalDocument.model_validate(d) for d in payload["documents"]]
         registry = PatientRegistry()
         for p in payload["patients"]:

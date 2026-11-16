@@ -22,6 +22,7 @@ class Turn:
     answers: List[Dict[str, Any]] = field(default_factory=list)  # {label, markdown, summary}
     blocked: str = ""
     case_id: str = ""
+    trace_id: str = ""  # Langfuse trace of this turn (when tracing is on)
     ts: str = field(default_factory=local_minute)
 
     def add_answer(self, label: str, markdown: str, summary: str) -> None:

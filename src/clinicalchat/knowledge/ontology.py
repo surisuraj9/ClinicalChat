@@ -76,6 +76,11 @@ ALLERGENS = {
     "ibuprofen": ("Medication", ["nsaid", "nsaids"]),
     "paracetamol": ("Medication", ["acetaminophen"]),
     "penicillin": ("Medication", ["amoxicillin", "penicillins"]),
+    "aspirin": ("Medication", ["acetylsalicylic acid", "asa"]),
+    "banana": ("Food", []),
+    "avocado": ("Food", []),
+    "kiwi": ("Food", ["kiwifruit", "kiwi fruit"]),
+    "chestnut": ("Food", ["chestnuts"]),
     "iodinated contrast": ("Medication", ["iodine", "contrast dye", "contrast media", "contrast agent", "iv contrast", "ct contrast", "radiocontrast", "x-ray dye"]),
 }
 
@@ -93,6 +98,12 @@ CROSS_REACTIVITY = [
     ("cockroach", "shellfish", "MODERATE", "Tropomyosin pan-allergen"),
     ("pollen", "oral allergy foods (apple, carrot, celery)", "MODERATE", "Pollen-food (oral allergy) syndrome via PR-10 proteins"),
     ("nickel", "cobalt", "MODERATE", "Common metal co-sensitisation in contact dermatitis"),
+    # course knowledge graph (Week 2): latex-fruit syndrome, aspirin / NSAID cross-reactivity
+    ("latex", "banana", "MODERATE", "Latex-fruit syndrome (hevein-like class I chitinases)"),
+    ("latex", "avocado", "MODERATE", "Latex-fruit syndrome (hevein-like class I chitinases)"),
+    ("latex", "kiwi", "MODERATE", "Latex-fruit syndrome (hevein-like class I chitinases)"),
+    ("latex", "chestnut", "MODERATE", "Latex-fruit syndrome (hevein-like class I chitinases)"),
+    ("aspirin", "ibuprofen", "HIGH", "COX-1 inhibition: aspirin / NSAID-exacerbated reactions cross over"),
     ("pet dander", "pet dander", "MODERATE", "Cat and dog allergens commonly co-sensitise"),
 ]
 
@@ -117,6 +128,10 @@ ALLERGEN_DRUG_RULES = {
     "milk": [
         ("Lactose-containing dry-powder inhaler", "class", "MODERATE", "Lactose carrier may contain milk protein; labelled contraindication in severe milk protein allergy"),
     ],
+    "aspirin": [
+        ("NSAID (non-selective COX inhibitor)", "class", "HIGH", "COX-1 inhibition cross-reactivity (aspirin, ibuprofen, naproxen, diclofenac)"),
+        ("COX-2 selective NSAID", "class", "LOW", "Selective COX-2 inhibitors are usually tolerated; consider supervised challenge"),
+    ],
     "peanut": [
         ("Peanut-oil-containing excipient", "class", "HIGH", "Arachis (peanut) oil excipients are contraindicated in peanut allergy"),
     ],
@@ -127,10 +142,12 @@ ALLERGEN_ALTERNATIVES = {
     "iodinated contrast": ["non-contrast CT or MRI if it answers the question", "premedication protocol per local policy "
                            "if contrast is essential"],
     "ibuprofen": ["paracetamol", "celecoxib (under supervision)"],
+    "aspirin": ["paracetamol", "celecoxib (under supervision)"],
     "paracetamol": ["ibuprofen (if no NSAID intolerance)", "non-drug measures"],
     "sulfamethoxazole": ["amoxicillin (if no penicillin allergy)", "azithromycin"],
     "penicillin": ["azithromycin", "ceftriaxone (low risk, monitor)"],
     "milk": ["pressurised metered-dose inhaler instead of lactose dry-powder inhaler"],
+    "latex": ["nitrile or vinyl (latex-free) gloves, catheters and devices"],
 }
 
 # (drug a, drug b, severity, effect, management)
@@ -183,7 +200,13 @@ CONDITION_CONTRAINDICATIONS = {
     "Anemia": [
         ("NSAID (non-selective COX inhibitor)", "class", "MINOR", "GI blood loss can worsen anaemia"),
     ],
+    "Heart failure": [
+        ("NSAID (non-selective COX inhibitor)", "class", "MAJOR", "Sodium and fluid retention can worsen heart failure"),
+    ],
 }
+# specific liver diagnoses carry the same cautions as "Liver dysfunction"
+for _liver in ("Hepatitis", "Cirrhosis", "Fatty liver"):
+    CONDITION_CONTRAINDICATIONS[_liver] = list(CONDITION_CONTRAINDICATIONS["Liver dysfunction"])
 
 # --- Diagnoses, tests, symptoms, treatments --------------------------------------------------
 # condition -> keywords used to recognise it in free text
@@ -222,6 +245,14 @@ CONDITION_KEYWORDS = {
     "Gastroenteritis": ["gastroenteritis", "stomach flu", "food poisoning"],
     "Migraine": ["migraine"],
     "Allergic skin reaction": ["urticaria", "dermatitis", "eczema", "allergic rash"],
+    # course knowledge graph (Week 2) diagnoses
+    "Leukemia": ["leukemia", "leukaemia"],
+    "Hepatitis": ["hepatitis"],
+    "Cirrhosis": ["cirrhosis"],
+    "Fatty liver": ["fatty liver", "nafld", "hepatic steatosis"],
+    "Dehydration": ["dehydration", "dehydrated"],
+    "Bronchitis": ["bronchitis"],
+    "Heart failure": ["heart failure", "cardiac failure", "chf"],
 }
 
 # canonical test -> (regex patterns matched against lower-cased parameter names)
@@ -286,15 +317,23 @@ TEST_INDICATES = [
     ("BMI", "HIGH", "Obesity"),
 ]
 
+# course knowledge graph (Week 2): test panels and the diagnoses they CONFIRM
+TEST_PANELS = {
+    "CBC": ["Anemia", "Infection / inflammation", "Leukemia"],
+    "LFT": ["Hepatitis", "Cirrhosis", "Fatty liver"],
+    "KFT": ["Chronic kidney disease", "Dehydration"],
+    "Thyroid panel": ["Hypothyroidism", "Hyperthyroidism"],
+}
+
 # symptom -> conditions it can suggest
 SYMPTOMS = {
     "chest pain": ["Myocardial infarction", "Coronary artery disease", "Pneumonia"],
-    "shortness of breath": ["Asthma", "Pneumonia", "Anemia", "Myocardial infarction", "Anaphylaxis"],
+    "shortness of breath": ["Asthma", "Pneumonia", "Anemia", "Myocardial infarction", "Anaphylaxis", "Heart failure"],
     "breathlessness": ["Asthma", "Pneumonia", "Anemia"],
     "wheezing": ["Asthma", "Anaphylaxis"],
-    "cough": ["Viral respiratory infection", "Asthma", "Pneumonia"],
+    "cough": ["Viral respiratory infection", "Asthma", "Pneumonia", "Bronchitis"],
     "fever": ["Viral respiratory infection", "Pneumonia", "Infection / inflammation"],
-    "fatigue": ["Anemia", "Hypothyroidism", "Type 2 diabetes mellitus", "Chronic kidney disease"],
+    "fatigue": ["Anemia", "Hypothyroidism", "Type 2 diabetes mellitus", "Chronic kidney disease", "Infection / inflammation"],
     "weakness": ["Anemia", "Hypothyroidism"],
     "pallor": ["Anemia"],
     "weight gain": ["Hypothyroidism", "Obesity"],
@@ -349,7 +388,7 @@ SYMPTOM_SYNONYMS = {
 
 # condition -> (confirmatory investigations, typical treatments)
 CONDITION_WORKUP = {
-    "Anemia": (["CBC", "Peripheral smear", "Ferritin"], ["ferrous sulfate"]),
+    "Anemia": (["CBC", "Peripheral smear", "Ferritin"], ["ferrous sulfate", "Vitamin B12 injection (if B12 deficient)"]),
     "Iron deficiency": (["Ferritin", "Iron studies"], ["ferrous sulfate"]),
     "Type 2 diabetes mellitus": (["HbA1c", "Fasting glucose"], ["metformin", "Lifestyle modification"]),
     "Dyslipidemia": (["Lipid profile"], ["atorvastatin", "Lifestyle modification"]),
@@ -372,4 +411,13 @@ CONDITION_WORKUP = {
     "Gastroenteritis": (["Clinical examination", "Stool test", "Electrolytes"], ["Oral rehydration"]),
     "Migraine": (["Clinical examination"], ["Headache diary", "paracetamol"]),
     "Allergic skin reaction": (["Clinical examination", "Skin prick test"], ["cetirizine", "Allergen avoidance"]),
+    "Infection / inflammation": (["CBC", "CRP", "Blood culture"], ["Antibiotics (if bacterial)", "Antivirals (if viral)"]),
+    "Hyperthyroidism": (["Thyroid panel", "TSH"], ["Endocrinology referral"]),
+    "Leukemia": (["CBC", "Peripheral smear", "Bone marrow biopsy"], ["Haematology referral"]),
+    "Hepatitis": (["LFT", "Hepatitis serology"], ["Antivirals (if viral)", "Hepatology referral"]),
+    "Cirrhosis": (["LFT", "Ultrasound abdomen", "Prothrombin time / INR"], ["Hepatology referral"]),
+    "Fatty liver": (["LFT", "Ultrasound abdomen"], ["Lifestyle modification"]),
+    "Dehydration": (["KFT", "Electrolytes"], ["Oral rehydration"]),
+    "Bronchitis": (["Clinical examination", "Chest X-ray"], ["Rest and fluids"]),
+    "Heart failure": (["Echocardiogram", "BNP", "Chest X-ray"], ["Cardiology referral"]),
 }

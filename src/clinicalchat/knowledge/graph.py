@@ -1,10 +1,23 @@
-"""NetworkX medical knowledge graph: clinical ontology + patient facts + deterministic safety checks."""
+"""NetworkX medical knowledge graph: clinical ontology + patient facts + deterministic safety checks.
+
+Vocabulary follows the course design (Week 2). Every node has a ``type``:
+TEST, SYMPTOM, DIAGNOSIS, TREATMENT, ALLERGEN, MEDICATION, MEDICATION_CLASS, PATIENT. Clinical relations:
+
+    TEST      ─CONFIRMS──────▶ DIAGNOSIS     (lab pattern with a direction, panel, or confirmatory work-up)
+    SYMPTOM   ─INDICATES─────▶ DIAGNOSIS
+    ALLERGEN  ─CROSS_REACTIVE▶ ALLERGEN
+    TREATMENT ─TREATS────────▶ DIAGNOSIS     (medicines too)
+
+Safety relations: ALLERGEN ─AVOID▶ MEDICATION(_CLASS), ALLERGEN ─SAFE_ALTERNATIVE▶ TREATMENT,
+MEDICATION ─BELONGS_TO▶ MEDICATION_CLASS, MEDICATION ─INTERACTS▶ MEDICATION, DIAGNOSIS ─CONTRAINDICATES▶ MEDICATION.
+Patient facts: HAS_ALLERGY, TAKES, HAS_CONDITION, ABNORMAL_RESULT, SUGGESTED_CONDITION, REPORTS_SYMPTOM.
+"""
 
 from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import networkx as nx
 
@@ -12,6 +25,9 @@ from clinicalchat.domain.models import LabStatus, PatientProfile, SafetyAlert
 from clinicalchat.knowledge import ontology as O
 
 ALLERGY_RISK_TO_LEVEL = {"HIGH": "CONTRAINDICATED", "MODERATE": "MAJOR", "LOW": "MODERATE"}
+NODE_TYPES = {"test": "TEST", "symptom": "SYMPTOM", "condition": "DIAGNOSIS", "treatment": "TREATMENT",
+              "allergen": "ALLERGEN", "drug": "MEDICATION", "drug_class": "MEDICATION_CLASS", "patient": "PATIENT"}
+CONFIRMS, INDICATES, CROSS_REACTIVE, TREATS = "CONFIRMS", "INDICATES", "CROSS_REACTIVE", "TREATS"
 
 
 def nid(kind: str, name: str) -> str:
@@ -42,7 +58,7 @@ class MedicalKnowledgeGraph:
     def _node(self, kind: str, name: str, **attrs) -> str:
         key = nid(kind, name)
         if key not in self.g:
-            self.g.add_node(key, kind=kind, label=name, **attrs)
+            self.g.add_node(key, kind=kind, type=NODE_TYPES[kind], label=name, **attrs)
         return key
 
     def _build_ontology(self) -> None:
@@ -60,7 +76,7 @@ class MedicalKnowledgeGraph:
             self._node("allergen", allergen, category=cat, aliases=aliases)
         for a, b, risk, why in O.CROSS_REACTIVITY:
             for x, y in ((a, b), (b, a)) if a != b else ((a, b),):
-                self.g.add_edge(nid("allergen", x), nid("allergen", y), rel="CROSS_REACTS", risk=risk, reason=why)
+                self.g.add_edge(nid("allergen", x), nid("allergen", y), rel=CROSS_REACTIVE, risk=risk, reason=why)
 
     def _add_safety_rules(self) -> None:
         """Allergen -> drugs to avoid, safe alternatives, drug-drug interactions."""
@@ -86,18 +102,22 @@ class MedicalKnowledgeGraph:
         for test in O.TESTS:
             self._node("test", test)
         for test, direction, cond in O.TEST_INDICATES:
-            self.g.add_edge(nid("test", test), self._node("condition", cond), rel="INDICATES", direction=direction)
+            self.g.add_edge(nid("test", test), self._node("condition", cond), rel=CONFIRMS, direction=direction,
+                            basis="lab pattern")
+        for panel, conds in O.TEST_PANELS.items():
+            for cond in conds:
+                self.g.add_edge(self._node("test", panel), self._node("condition", cond), rel=CONFIRMS, basis="panel")
         for symptom, conds in O.SYMPTOMS.items():
             s = self._node("symptom", symptom)
             for cond in conds:
-                self.g.add_edge(s, self._node("condition", cond), rel="SUGGESTS")
+                self.g.add_edge(s, self._node("condition", cond), rel=INDICATES)
         for cond, (workup, treatments) in O.CONDITION_WORKUP.items():
             c = self._node("condition", cond)
             for w in workup:
-                self.g.add_edge(c, self._node("test", w) if w in O.TESTS else self._node("treatment", w), rel="CONFIRMED_BY")
+                self.g.add_edge(self._node("test", w), c, rel=CONFIRMS, basis="work-up")
             for t in treatments:
-                target = nid("drug", t) if t in O.DRUGS else self._node("treatment", t)
-                self.g.add_edge(c, target, rel="TREATED_WITH")
+                source = nid("drug", t) if t in O.DRUGS else self._node("treatment", t)
+                self.g.add_edge(source, c, rel=TREATS)
 
     def add_patient(self, p: PatientProfile) -> None:
         self.patients[p.patient_key] = p
@@ -120,7 +140,7 @@ class MedicalKnowledgeGraph:
             tn = nid("test", test)
             self.g.add_edge(pn, tn, rel="ABNORMAL_RESULT", direction=direction, evidence=lab.line())
             for _, cn, data in list(self.g.out_edges(tn, data=True)):
-                if data.get("rel") == "INDICATES" and data.get("direction") == direction:
+                if data.get("rel") == CONFIRMS and data.get("direction") == direction:
                     self.g.add_edge(pn, cn, rel="SUGGESTED_CONDITION", evidence=lab.line())
         for reported in p.symptoms:
             for symptom in self.symptoms_in_text(reported) or []:
@@ -203,7 +223,7 @@ class MedicalKnowledgeGraph:
             return []
         out = []
         for _, v, d in self.g.out_edges(node, data=True):
-            if d["rel"] == "CROSS_REACTS":
+            if d["rel"] == CROSS_REACTIVE:
                 out.append({"allergen": self.g.nodes[v]["label"], "risk": d["risk"], "reason": d["reason"], "type": "allergen"})
             elif d["rel"] == "AVOID":
                 out.append({"allergen": self.g.nodes[v]["label"], "risk": d["risk"], "reason": d["reason"], "type": "drug"})
@@ -287,7 +307,7 @@ class MedicalKnowledgeGraph:
         cnode = nid("condition", cond)
         if cnode not in self.g:
             return []
-        if drug in {self.g.nodes[v]["label"] for v, _ in self._edges(cnode, "TREATED_WITH")}:
+        if drug in self.treatments_for(cond):  # e.g. aspirin is a treatment for MI, not a contraindication
             return []  # the drug treats this condition
         return [SafetyAlert(level=d["severity"], category="condition", drug=drug, against=cond, message=d["reason"],
                             management="Review risk/benefit; consider alternatives")
@@ -327,7 +347,7 @@ class MedicalKnowledgeGraph:
             if sn not in self.g:
                 continue
             for _, v, d in self.g.out_edges(sn, data=True):
-                if d["rel"] == "SUGGESTS":
+                if d["rel"] == INDICATES:
                     e = scores.setdefault(self.g.nodes[v]["label"], {"condition": self.g.nodes[v]["label"], "score": 0, "support": []})
                     e["score"] += 1
                     e["support"].append(f"symptom: {s}")
@@ -341,9 +361,71 @@ class MedicalKnowledgeGraph:
             e["workup"], e["treatment"] = workup, treat
         return sorted(scores.values(), key=lambda e: -e["score"])
 
+    # ------------------------------------------------------------------ course query functions (Week 2)
+    def find_diagnoses_for_symptoms(self, symptoms: Sequence[str]) -> List[Dict[str, object]]:
+        """Diagnoses INDICATED by the symptoms, ranked by how many symptoms point to each (free text is accepted)."""
+        canonical = list(dict.fromkeys(c for s in symptoms for c in (self.symptoms_in_text(s) or [s.lower().strip()])))
+        return [{"diagnosis": d["condition"], "matching_symptoms": d["score"],
+                 "symptoms": [x.split(": ", 1)[1] for x in d["support"]], "confirm_with": d["workup"]}
+                for d in self.differential(canonical)]
+
+    def get_cross_reactive_allergens(self, allergen: str) -> List[str]:
+        """Allergens linked by CROSS_REACTIVE (course function); medicines to avoid come from ``cross_reactive``."""
+        return [x["allergen"] for x in self.cross_reactive(allergen) if x["type"] == "allergen"]
+
+    def tests_confirming(self, diagnosis: str) -> List[str]:
+        node = nid("condition", diagnosis)
+        if node not in self.g:
+            return []
+        return sorted({self.g.nodes[u]["label"] for u, _, d in self.g.in_edges(node, data=True)
+                       if d["rel"] == CONFIRMS})
+
+    def treatments_for(self, diagnosis: str) -> List[str]:
+        node = nid("condition", diagnosis)
+        if node not in self.g:
+            return []
+        return [self.g.nodes[u]["label"] for u, _, d in self.g.in_edges(node, data=True) if d["rel"] == TREATS]
+
+    def allergy_safety_card(self, allergen: str) -> Dict[str, object]:
+        """Everything the "Allergy Safety Check" needs about one allergen (knowledge graph only, no patient data)."""
+        name = self.resolve_allergen(allergen)
+        node = nid("allergen", name) if name else None
+        related = self.cross_reactive(name) if name else []
+        return {"query": allergen, "allergen": name,
+                "category": self.g.nodes[node].get("category", "") if node in self.g else "",
+                "cross_reactive_allergens": [x for x in related if x["type"] == "allergen"],
+                "avoid_medicines": [x for x in related if x["type"] == "drug"],
+                "safe_alternatives": self.safe_alternatives(name) if name else []}
+
+    def known_allergens(self) -> List[str]:
+        return sorted(O.ALLERGENS)
+
+    def to_mermaid(self, relations: Sequence[str] = (CONFIRMS, INDICATES, CROSS_REACTIVE, TREATS),
+                   only: Optional[Iterable[str]] = None) -> str:
+        """The course relations as a Mermaid flowchart (used to draw docs/diagrams/09-knowledge-graph.png)."""
+        keep = set(only) if only else None
+        ids: Dict[str, str] = {}
+        drawn: Set[Tuple[str, str, str]] = set()
+        lines = ["flowchart LR"]
+        for u, v, d in self.g.edges(data=True):
+            if d["rel"] not in relations or (keep and not ({u, v} <= keep)):
+                continue
+            key = (*sorted((u, v)), d["rel"]) if d["rel"] == CROSS_REACTIVE else (u, v, d["rel"])  # symmetric / multi-edges once
+            if key in drawn:
+                continue
+            drawn.add(key)
+            for n in (u, v):
+                if n not in ids:
+                    ids[n] = f"n{len(ids)}"
+                    node = self.g.nodes[n]
+                    lines.append(f'  {ids[n]}["{node["type"]}: {node["label"]}"]:::{node["type"].lower()}')
+            lines.append(f"  {ids[u]} -->|{d['rel']}| {ids[v]}")
+        return "\n".join(lines)
+
     def stats(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         for _, d in self.g.nodes(data=True):
             counts[d["kind"]] = counts.get(d["kind"], 0) + 1
+        counts["nodes"] = self.g.number_of_nodes()
         counts["edges"] = self.g.number_of_edges()
         return counts

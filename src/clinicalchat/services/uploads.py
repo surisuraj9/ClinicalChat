@@ -11,8 +11,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from clinicalchat.domain.clock import utc_minute
 from clinicalchat.domain.conversation import ChatSession, Event, Turn
 from clinicalchat.domain.models import ClinicalDocument, Domain, PatientProfile
-from clinicalchat.domain.roles import AGENT_LABELS, AgentName, Role, RolePolicy, policy
+from clinicalchat.domain.roles import AGENT_LABELS, AGENT_ORDER, AgentName, Role, RolePolicy, policy
 from clinicalchat.infrastructure.repositories.uploads import UploadRepository
+from clinicalchat.infrastructure.tracing import activate
 from clinicalchat.ingestion.quality import assess_document
 from clinicalchat.ingestion.uploads import MAX_UPLOAD_FILES, foreign_name, parse_upload
 from clinicalchat.services.chat import SymptomRecorder, routed_event
@@ -51,17 +52,20 @@ class UploadService:
         message = (message or "").strip()
         pol = policy(session.role)
         key = session.own_patient if pol.own_record_only else session.selected_patient
+        question = message or f"[upload] {', '.join(n for _, n in files)}"
         ctx = TurnContext(message, session, _upload_plan(key, pol, session.role),
-                          Turn(question=message or f"[upload] {', '.join(n for _, n in files)}", role=session.role.value,
-                               patient_key=key))
-        refusal = _refusal(pol, key, files)
-        if refusal:
-            yield from self._block(ctx, refusal, "🔒 Upload" if not pol.can_upload or not key else "📄 Upload")
-        else:
-            allowed = (yield from self._route_message(ctx)) if message else True
-            if allowed:
-                yield from self._process(ctx, files, report_type)
-        self.recorder.finish(ctx)
+                          Turn(question=question, role=session.role.value, patient_key=key),
+                          trace=self.recorder.start(question, session, name="report-upload"))
+        try:
+            refusal = _refusal(pol, key, files)
+            if refusal:
+                yield from self._block(ctx, refusal, "🔒 Upload" if not pol.can_upload or not key else "📄 Upload")
+            else:
+                allowed = (yield from self._route_message(ctx)) if message else True
+                if allowed:
+                    yield from self._process(ctx, files, report_type)
+        finally:
+            self.recorder.finish(ctx)
 
     # ------------------------------------------------------------------ steps
     def _route_message(self, ctx: TurnContext) -> Iterator[Event]:
@@ -82,7 +86,9 @@ class UploadService:
         key, session = ctx.patient_key, ctx.session
         patient = self.kb.patients.get(key)
         results = yield from self._read_all(files, ctx, patient, report_type)
-        accepted, lines = self._accept(files, results, patient, session.username)
+        with activate(ctx.trace.child("index-reports", input={"files": [n for _, n in files]})) as span:
+            accepted, lines = self._accept(files, results, patient, session.username)
+            span.end({"accepted": [n for n, _ in accepted]})
         total = len(files)
         head = (f"**{len(accepted)} of {total}** report(s) added to the record." if total > 1 else
                 ("Report added to the record." if accepted else "The report was not added."))
@@ -97,8 +103,12 @@ class UploadService:
             self.symptoms.save(key, ctx.plan.symptoms)
         ctx.question = ctx.turn.question = _upload_question(ctx, [n for n, _ in accepted], patient)
         doc_ids = [d.doc_id for _, d in accepted]
-        yield from self.pipeline.run(ctx, upload_doc_ids=doc_ids)
-        yield from (self.patient.respond(ctx, doc_ids) if ctx.is_patient else self.staff.respond(ctx))
+        if ctx.is_patient:
+            yield from self.pipeline.run(ctx, upload_doc_ids=doc_ids)
+            yield from self.patient.respond(ctx, doc_ids)
+        else:
+            yield from self.pipeline.run(ctx, upload_doc_ids=doc_ids, on_analysed=self.staff.prefetch)
+            yield from self.staff.respond(ctx)
 
     def _read_all(self, files: Files, ctx: TurnContext, patient: PatientProfile,
                   report_type: str) -> Iterator[Event]:
@@ -110,12 +120,18 @@ class UploadService:
 
         def read(item: Tuple[Path, str]):
             path, name = item
+            span = ctx.trace.child("parse-report", as_type="tool", input={"file": name, "report_type": report_type})
             try:
-                return parse_upload(Path(path), patient_key=patient.patient_key, patient_name=patient.name,
-                                    report_type=report_type, uploaded_by=ctx.session.username, uploaded_at=utc_minute(),
-                                    display_name=name, cache_dir=self.kb.settings.work_dir / "ocr_cache"), None
+                doc = parse_upload(Path(path), patient_key=patient.patient_key, patient_name=patient.name,
+                                   report_type=report_type, uploaded_by=ctx.session.username, uploaded_at=utc_minute(),
+                                   display_name=name, cache_dir=self.kb.settings.work_dir / "ocr_cache")
             except Exception as exc:  # one unreadable file must not stop the others
+                span.end(error=f"{type(exc).__name__}: {exc}")
                 return None, exc
+            span.end({"category": doc.category, "domain": doc.domain.value, "sections": len(doc.sections),
+                      "extraction": doc.extraction_method,
+                      "lab_values": sum(len(s.lab_results) for s in doc.sections)})
+            return doc, None
 
         results: Dict[int, tuple] = {}
         with ThreadPoolExecutor(max_workers=min(4, total), thread_name_prefix="upload") as pool:
@@ -166,7 +182,7 @@ class UploadService:
 
 
 def _upload_plan(key: Optional[str], pol: RolePolicy, role: Role) -> RoutePlan:
-    agents = [a for a in AgentName if a in pol.agents and (a != AgentName.COMMUNICATION or role == Role.PATIENT)]
+    agents = [a for a in AGENT_ORDER if a in pol.agents and (a != AgentName.COMMUNICATION or role == Role.PATIENT)]
     return RoutePlan(mode="case", patient_key=key, patient_source="session", check_allergies=True, agents=agents)
 
 

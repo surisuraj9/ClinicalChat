@@ -5,7 +5,7 @@ information and checks — it never clears a safety warning or overrides the pat
 from __future__ import annotations
 
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Iterator, List, Optional, Sequence
 
@@ -13,7 +13,6 @@ from clinicalchat.domain.conversation import Event
 from clinicalchat.domain.models import Domain
 from clinicalchat.domain.roles import policy
 from clinicalchat.domain.web_evidence import WebResult, WebSearchOutcome
-from clinicalchat.infrastructure.tracing import Tracer
 from clinicalchat.infrastructure.web_search import TavilySearch
 from clinicalchat.knowledge.graph import MedicalKnowledgeGraph
 from clinicalchat.services.patients import PatientDirectory
@@ -55,25 +54,31 @@ def guideline_query(question: str, conditions: Sequence[str]) -> str:
 
 
 class WebEnrichment:
-    def __init__(self, web: TavilySearch, patients: PatientDirectory, kg: MedicalKnowledgeGraph, tracer: Tracer):
+    def __init__(self, web: TavilySearch, patients: PatientDirectory, kg: MedicalKnowledgeGraph):
         self.web = web
         self.patients = patients
         self.kg = kg
-        self.tracer = tracer
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="web")
 
     @property
     def enabled(self) -> bool:
         return self.web.enabled
 
-    def search(self, kind: str, query: str, ctx: TurnContext,
-               wait: Optional[float] = None) -> Iterator[Event]:
-        """Search trusted sites; returns the outcome (or None when off / too slow for ``wait`` seconds)."""
+    def start(self, kind: str, query: str, ctx: TurnContext) -> Optional[Future]:
+        """Start a search in the background (collect it later with ``search(..., started=...)``)."""
         if not self.web.enabled:
+            return None
+        return self._pool.submit(self.web.search, query, kind, self.patients.names(), ctx.llm_config(ctx.trace))
+
+    def search(self, kind: str, query: str, ctx: TurnContext, wait: Optional[float] = None,
+               started: Optional[Future] = None) -> Iterator[Event]:
+        """Search trusted sites (or collect a search ``started`` earlier); returns the outcome, or None when off / too
+        slow for ``wait`` seconds."""
+        fut = started or self.start(kind, query, ctx)
+        if fut is None:
             return None
         yield Event("status", "🌐 Web search — trusted sites", f"Searching {SITES[kind]} (no personal details are sent)",
                     "pending", "web")
-        fut = self._pool.submit(self.web.search, query, kind, self.patients.names(), self.tracer.config_for(ctx.session))
         try:
             out = fut.result(timeout=wait)
         except FutureTimeout:  # answer now; the search finishes in the background and is cached for next time

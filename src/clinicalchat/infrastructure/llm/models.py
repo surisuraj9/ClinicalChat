@@ -13,7 +13,7 @@ from langchain_core.outputs import ChatResult
 from clinicalchat.config import Settings
 from clinicalchat.infrastructure.llm.cache import SQLiteLLMCache
 
-INSIGHT, FAST = "insight", "fast"
+INSIGHT, FAST, SPECIALIST = "insight", "fast", "specialist"
 NO_KEY = "No LLM configured: set OPENAI_API_KEY in .env."
 
 
@@ -39,11 +39,12 @@ def create_chat_model(settings: Settings, purpose: str = INSIGHT) -> BaseChatMod
         return UnavailableChatModel()
     from langchain_openai import ChatOpenAI
 
-    fast = purpose == FAST
-    return ChatOpenAI(model=settings.openai_fast_model if fast else settings.openai_model, temperature=0.0,
-                      api_key=settings.openai_api_key, timeout=settings.openai_timeout,
-                      max_retries=settings.llm_retries, stream_usage=True,
-                      max_tokens=settings.communication_max_tokens if fast else settings.insight_max_tokens,
+    model, max_tokens = {
+        FAST: (settings.openai_fast_model, settings.communication_max_tokens),
+        SPECIALIST: (settings.openai_specialist_model, settings.specialist_max_tokens),
+    }.get(purpose, (settings.openai_model, settings.insight_max_tokens))
+    return ChatOpenAI(model=model, temperature=0.0, api_key=settings.openai_api_key, timeout=settings.openai_timeout,
+                      max_retries=settings.llm_retries, stream_usage=True, max_tokens=max_tokens,
                       model_kwargs={"response_format": {"type": "json_object"}})
 
 
@@ -60,4 +61,5 @@ def describe_llm(settings: Settings) -> dict:
     if not settings.openai_api_key:
         return {"provider": "unavailable", "error": NO_KEY}
     return {"provider": "openai", "model": settings.openai_model, "fast_model": settings.openai_fast_model,
+            "specialist_model": settings.openai_specialist_model if settings.specialists_use_llm else "off (rule-based)",
             "cache": settings.llm_cache}

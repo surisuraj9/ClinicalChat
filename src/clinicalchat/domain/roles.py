@@ -1,4 +1,13 @@
-"""Role-based access control: which agents run for a role, which record domains it may see and how answers are written."""
+"""Role-based access control: which agents run for a role, which record domains it may see and how answers are written.
+
+Record domains follow the course design (Week 5 ``role_permissions``) with one deliberate extension — a patient may
+read their OWN complete record:
+
+    patient      own record only, all domains        clinician    lab + allergy (+ patient record, reference)
+    radiologist  radiology (+ reference)             coordinator  everything (care coordination)
+
+Care-team hand-over notes on a case (the radiologist's read, the triage note, the AI case summary) are shared with
+the assigned team, as in any hospital workflow; raw records outside a role's domains are not."""
 
 from __future__ import annotations
 
@@ -22,6 +31,10 @@ class AgentName(str, Enum):
     RISK = "risk"
     INSIGHT = "insight"
     COMMUNICATION = "communication"
+    # the course's AI specialists, run inside Clinical Analysis (agents/specialists/ai.py)
+    LAB_INTERPRETER = "lab_interpreter"
+    RADIOLOGY_ANALYZER = "radiology_analyzer"
+    ALLERGY_SAFETY = "allergy_safety"
 
 
 AGENT_LABELS = {
@@ -30,9 +43,15 @@ AGENT_LABELS = {
     AgentName.RISK: "🚨 Risk Detection",
     AgentName.INSIGHT: "💡 Insight Generation",
     AgentName.COMMUNICATION: "💬 Patient Communication",
+    AgentName.LAB_INTERPRETER: "🧪 Lab Interpreter (AI)",
+    AgentName.RADIOLOGY_ANALYZER: "🩻 Radiology Analyzer (AI)",
+    AgentName.ALLERGY_SAFETY: "🛡️ Allergy Safety (AI)",
 }
-AGENT_ORDER = list(AgentName)
+# the five pipeline agents shown in the progress panel (the AI specialists are part of Clinical Analysis)
+AGENT_ORDER = [AgentName.EXTRACTION, AgentName.ANALYSIS, AgentName.RISK, AgentName.INSIGHT, AgentName.COMMUNICATION]
 ALL_DOMAINS = frozenset(Domain)
+CLINICIAN_DOMAINS = frozenset({Domain.LAB, Domain.ALLERGY, Domain.PATIENT_RECORD, Domain.REFERENCE})
+RADIOLOGIST_DOMAINS = frozenset({Domain.RADIOLOGY, Domain.REFERENCE})
 
 
 @dataclass(frozen=True)
@@ -58,7 +77,7 @@ POLICIES = {
                   "when something needs urgent medical attention."),
     ),
     Role.CLINICIAN: RolePolicy(
-        role=Role.CLINICIAN, label="Clinician", agents=frozenset(AgentName), domains=ALL_DOMAINS,
+        role=Role.CLINICIAN, label="Clinician", agents=frozenset(AgentName), domains=CLINICIAN_DOMAINS,
         own_record_only=False, can_upload=True,
         audience=("CLINICIAN. Give full technical detail: exact values with reference ranges, clinical patterns, "
                   "differential diagnosis, treatment considerations and recommended follow-up tests. Be concise and "
@@ -66,7 +85,7 @@ POLICIES = {
     ),
     Role.RADIOLOGIST: RolePolicy(
         role=Role.RADIOLOGIST, label="Radiologist", agents=_STAFF_AGENTS,
-        domains=frozenset({Domain.RADIOLOGY, Domain.ALLERGY, Domain.REFERENCE}),
+        domains=RADIOLOGIST_DOMAINS,
         own_record_only=False, can_upload=False,
         audience=("RADIOLOGIST. Focus on imaging: technique, findings by region, impression, differential diagnosis, "
                   "critical findings, comparison/further imaging recommendations and contrast-safety considerations. "

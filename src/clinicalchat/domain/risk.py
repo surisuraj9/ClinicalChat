@@ -35,7 +35,7 @@ def bump(level: str) -> str:
 class RiskIndicator(BaseModel):
     indicator: str
     level: str = "LOW"
-    category: str = "lab"  # lab | medication | allergy | imaging | symptom | pattern | consistency | extraction
+    category: str = "lab"  # lab | medication | allergy | imaging | symptom | pattern | consistency | extraction | ai_specialist
     source: str = ""
     escalate: bool = False
 

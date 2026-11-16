@@ -2,6 +2,10 @@
 
 Retrieval is "small-to-big": short chunks (sized for MiniLM's 256-token window) are embedded
 and searched, then the agents receive the full parent section for complete clinical context.
+
+Embeddings: OpenAI ``text-embedding-3-small`` when an OpenAI key is set (every call is traced in Langfuse with its
+token usage), otherwise the local all-MiniLM-L6-v2 model. If OpenAI cannot build the index the app falls back to the
+local model, and a failed search returns no hits instead of breaking the chat.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import chromadb
 
 from clinicalchat.config import Settings, get_settings
 from clinicalchat.domain.models import ClinicalDocument, Domain, Section
+from clinicalchat.infrastructure.tracing import activate, active_span
 
 log = logging.getLogger(__name__)
 
@@ -23,23 +28,61 @@ CHUNK_WORDS = 150
 CHUNK_OVERLAP = 30
 
 
-def build_embedding_function(settings: Settings):
+def _local_embedding_function(settings: Settings, strict: bool = False):
     """sentence-transformers when available, otherwise the ONNX export of the same MiniLM model."""
-    provider = settings.embedding_provider
-    if provider in {"auto", "sentence-transformers"}:
-        try:
-            from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+    try:
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-            ef = SentenceTransformerEmbeddingFunction(model_name=settings.embedding_model)
-            ef(["warm-up"])
-            return ef, f"sentence-transformers/{settings.embedding_model}"
-        except Exception as exc:
-            if provider == "sentence-transformers":
-                raise
-            log.info("sentence-transformers unavailable (%s); using ONNX MiniLM export", type(exc).__name__)
+        ef = SentenceTransformerEmbeddingFunction(model_name=settings.embedding_model)
+        ef(["warm-up"])
+        return ef, f"sentence-transformers/{settings.embedding_model}"
+    except Exception as exc:
+        if strict:
+            raise
+        log.info("sentence-transformers unavailable (%s); using ONNX MiniLM export", type(exc).__name__)
     from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
     return ONNXMiniLM_L6_V2(), "onnx/all-MiniLM-L6-v2"
+
+
+def _traced_openai_embedding_function(settings: Settings):
+    """OpenAI embeddings; each call becomes a Langfuse "embedding" observation (model, texts, token usage)."""
+    import numpy as np
+    import openai
+    from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+
+    class TracedOpenAIEmbeddingFunction(OpenAIEmbeddingFunction):
+        def __call__(self, input):  # noqa: A002 — Chroma's protocol name
+            if not input:
+                return []
+            span = active_span().child("embedding", as_type="embedding", model=self.model_name,
+                                       input={"texts": len(input), "first": str(input[0])[:200]})
+            try:
+                response = self.client.embeddings.create(model=self.model_name, input=list(input))
+            except Exception as exc:
+                span.end(error=f"{type(exc).__name__}: {exc}")
+                raise
+            usage = getattr(response, "usage", None)
+            span.end(output={"vectors": len(response.data), "dimensions": len(response.data[0].embedding)},
+                     usage_details={"input": int(getattr(usage, "prompt_tokens", 0) or 0)})
+            return [np.array(d.embedding, dtype=np.float32) for d in response.data]
+
+    ef = TracedOpenAIEmbeddingFunction(api_key_env_var="OPENAI_API_KEY", model_name=settings.openai_embedding_model)
+    ef.client = openai.OpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout, max_retries=2)
+    return ef, f"openai/{settings.openai_embedding_model}"
+
+
+def build_embedding_function(settings: Settings):
+    """EMBEDDING_PROVIDER: auto (OpenAI when a key is set, else local) | openai | local | sentence-transformers."""
+    provider = settings.embedding_provider
+    if provider == "openai" or (provider == "auto" and settings.openai_api_key):
+        try:
+            return _traced_openai_embedding_function(settings)
+        except Exception as exc:
+            if provider == "openai":
+                raise
+            log.warning("OpenAI embeddings unavailable (%s); using the local model", exc)
+    return _local_embedding_function(settings, strict=provider == "sentence-transformers")
 
 
 @dataclass
@@ -94,26 +137,46 @@ class VectorIndex:
 
     def index(self, documents: Sequence[ClinicalDocument], force: bool = False) -> int:
         """(Re)build the collection unless the stored one was built from exactly these documents."""
-        fingerprint = corpus_fingerprint(documents, self.embedding_name)
-
-        existing = None
         try:
-            existing = self.client.get_collection(self.collection_name, embedding_function=self.embedding_function)
-        except Exception:
-            existing = None
+            return self._index(documents, force)
+        except Exception as exc:
+            if not self.embedding_name.startswith("openai/"):
+                raise
+            log.warning("Indexing with OpenAI embeddings failed (%s); falling back to the local model", exc)
+            self.embedding_function, self.embedding_name = _local_embedding_function(self.settings)
+            return self._index(documents, force)
+
+    def _index(self, documents: Sequence[ClinicalDocument], force: bool) -> int:
+        fingerprint = corpus_fingerprint(documents, self.embedding_name)
+        existing = self._existing()
         if existing is not None and not force and (existing.metadata or {}).get("fingerprint") == fingerprint:
             self.collection = existing
             return existing.count()
-        if existing is not None:
+        if existing is not None or self._exists():
             self.client.delete_collection(self.collection_name)
-
         self.collection = self.client.create_collection(
             self.collection_name, embedding_function=self.embedding_function,
             metadata={"hnsw:space": "cosine", "fingerprint": fingerprint, "embedding": self.embedding_name},
         )
-        count = self._add(documents)
+        with active_span().step("vector-index-build", input={"documents": len(documents)},
+                                metadata={"embedding": self.embedding_name}) as span:
+            with activate(span):
+                count = self._add(documents)
+            span.update(output={"chunks": count})
         log.info("Indexed %d chunks with %s", count, self.embedding_name)
         return count
+
+    def _existing(self):
+        try:
+            return self.client.get_collection(self.collection_name, embedding_function=self.embedding_function)
+        except Exception:  # missing, or built with another embedding model (config conflict) → rebuilt
+            return None
+
+    def _exists(self) -> bool:
+        try:
+            return self.collection_name in [c if isinstance(c, str) else c.name for c in self.client.list_collections()]
+        except Exception:
+            return False
 
     def _add(self, documents: Sequence[ClinicalDocument]) -> int:
         ids, texts, metas = [], [], []
@@ -168,14 +231,24 @@ class VectorIndex:
                patient_key: Optional[str] = None, include_general: bool = True) -> List[SearchHit]:
         if self.collection is None:
             raise RuntimeError("Vector store not indexed yet")
-        result = self.collection.query(
-            query_texts=[query], n_results=k, where=self._where(domains, patient_key, include_general),
-            include=["documents", "metadatas", "distances"],
-        )
+        span = active_span().child("vector-search", as_type="retriever", input={"query": query, "k": k},
+                                   metadata={"domains": [d.value for d in domains or []], "patient": patient_key,
+                                             "embedding": self.embedding_name})
+        try:
+            with activate(span):
+                result = self.collection.query(
+                    query_texts=[query], n_results=k, where=self._where(domains, patient_key, include_general),
+                    include=["documents", "metadatas", "distances"],
+                )
+        except Exception as exc:  # e.g. the embedding API is down: answer without retrieved passages
+            log.warning("Vector search failed: %s", exc)
+            span.end(error=f"{type(exc).__name__}: {exc}")
+            return []
         hits = []
         for cid, text, meta, dist in zip(result["ids"][0], result["documents"][0],
                                          result["metadatas"][0], result["distances"][0], strict=True):
             hits.append(SearchHit(chunk_id=cid, text=text, score=round(1 - float(dist), 4), metadata=dict(meta)))
+        span.end(output=[{"source": h.source, "section": h.section_id, "score": h.score} for h in hits])
         return hits
 
     def count(self) -> int:
