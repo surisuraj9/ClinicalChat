@@ -146,6 +146,8 @@ src/clinicalchat/
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Diagrams: system context, layers, DI wiring, agent pipeline, question sequence, upload flow, case states, deployment; SOLID mapping |
 | [docs/FILE_GUIDE.md](docs/FILE_GUIDE.md) | Every file: what it does, who calls it, and how |
+| [docs/CLASS_GUIDE.md](docs/CLASS_GUIDE.md) | Where the code starts, every class (job + who uses it), where agents are configured and how they are called |
+| [docs/CODE_FLOW.md](docs/CODE_FLOW.md) | Technical walkthrough for Python beginners: the real code, line by line, from `clinicalchat serve` to each agent's answer; how to step through it in the debugger |
 | [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | Plain-English tour of the agents and the tools they use |
 | [docs/COURSE_ALIGNMENT.md](docs/COURSE_ALIGNMENT.md) | Week 1–8 course notebooks → files in this project |
 | [deployment/README.md](deployment/README.md) | Step-by-step AWS EC2 deployment (systemd, port 8000) |
